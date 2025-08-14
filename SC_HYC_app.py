@@ -473,24 +473,61 @@ if st.button("Daten laden & scoren", type="primary"):
     st.markdown("**Top 25 (Kill-Switch gefiltert):**")
     st.dataframe(ranked.head(25), use_container_width=True)
 
-    # Downloads
+    
+    # ─────────────────────────────────────────
+    # Downloads (robust, ohne Absturz)
+    # ─────────────────────────────────────────
     st.subheader("Download")
-    def df_to_bytes(df: pd.DataFrame, kind: str = "csv") -> bytes:
+    
+    def df_to_bytes(df: pd.DataFrame, kind: str = "csv"):
         if kind == "csv":
-            return df.to_csv(index=True).encode("utf-8")
+            return df.to_csv(index=True).encode("utf-8"), None
+    
+        if kind == "html":
+            return df.to_html(index=True).encode("utf-8"), None
+    
         if kind == "xlsx":
             bio = io.BytesIO()
-            with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+            engine = None
+            try:
+                import xlsxwriter  # noqa: F401
+                engine = "xlsxwriter"
+            except Exception:
+                pass
+            if engine is None:
+                try:
+                    import openpyxl  # noqa: F401
+                    engine = "openpyxl"
+                except Exception:
+                    return None, "Excel-Export deaktiviert: installiere 'xlsxwriter' oder 'openpyxl'."
+    
+            with pd.ExcelWriter(bio, engine=engine) as xw:
                 df.to_excel(xw, index=True, sheet_name="scores")
-            return bio.getvalue()
-        if kind == "html":
-            return df.to_html(index=True).encode("utf-8")
-        raise ValueError(kind)
-
+            return bio.getvalue(), None
+    
+        return None, f"Unbekanntes Format: {kind}"
+    
     c1, c2, c3 = st.columns(3)
-    c1.download_button("CSV herunterladen", data=df_to_bytes(ranked, "csv"), file_name="hy_scores.csv", mime="text/csv")
-    c2.download_button("Excel herunterladen", data=df_to_bytes(ranked, "xlsx"), file_name="hy_scores.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    c3.download_button("HTML herunterladen", data=df_to_bytes(ranked, "html"), file_name="hy_scores.html", mime="text/html")
+    
+    csv_bytes, _ = df_to_bytes(ranked, "csv")
+    c1.download_button("CSV herunterladen", data=csv_bytes,
+                       file_name="hy_scores.csv", mime="text/csv")
+    
+    xlsx_bytes, xlsx_err = df_to_bytes(ranked, "xlsx")
+    if xlsx_bytes is not None:
+        c2.download_button(
+            "Excel herunterladen",
+            data=xlsx_bytes,
+            file_name="hy_scores.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        c2.info(xlsx_err)
+    
+    html_bytes, _ = df_to_bytes(ranked, "html")
+    c3.download_button("HTML herunterladen", data=html_bytes,
+                       file_name="hy_scores.html", mime="text/html")
+
 
     # Hinweise/Limitierungen
     st.info(

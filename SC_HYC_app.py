@@ -1,549 +1,678 @@
-# streamlit_app.py
+# streamlit_eu_low_yield_screen_pro.py
 # -*- coding: utf-8 -*-
-# High-Yield Dividend Screener (Yahoo Finance) – mit Spalten-Pruning & Whitelist/Blacklist
+# EU High-Yield Screener mit:
+# - Index-Universen (Wikipedia/CSV) + Yahoo-Suffix
+# - 52W-Low innerhalb N Tage, DivR > Schwelle, D/E < Schwelle
+# - FX-Normalisierung in EUR/CHF (EZB-Raten)
+# - Presets (save/load)
+# - Daily Research Dashboard + Watchlist-Heatmap
+#
+# Autor: ChatGPT (GPT-5 Thinking)
 
 import warnings
 warnings.filterwarnings("ignore", message=".*bottleneck.*", category=UserWarning)
 
 import io
-from datetime import datetime, timedelta
-from typing import Tuple
+import math
+import json
+import time
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
+import altair as alt
 import yfinance as yf
 
 # ─────────────────────────────────────────────────────────────
-# UI Setup
+# Page Setup
 # ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="High-Yield Dividend Screener", layout="wide")
-st.title("High-Yield Dividend Screener")
+st.set_page_config(page_title="EU High-Yield Screener Pro", layout="wide")
+st.title("EU High-Yield Screener – 52W-Lows, D/E, FX, Indizes & Heatmap")
 
-st.caption("Kostenlose Daten via yfinance. Fehlende Spezial-Kennzahlen (CET1/SII/AFFO) werden neutral behandelt.")
+st.caption("Datenquelle: Yahoo Finance (yfinance). DivR = TTM-Dividende / letzter Preis. "
+           "D/E = Total Debt / Total Equity. FX via EZB-Raten. Wikipedia für Index-Universen.")
 
 # ─────────────────────────────────────────────────────────────
-# Scoring – Standardgewichte & Richtungen
+# Config – Indexquellen (Wikipedia) & Suffix-Mapping
 # ─────────────────────────────────────────────────────────────
-DEFAULT_WEIGHTS = {
-    # Sustainability 45
-    'HY_YIELD_FWD':10, 'HY_FCF_COVER':12, 'HY_PAYOUT':8,
-    'HY_NETDEBT_EBITDA':6, 'HY_INT_COVERAGE':5, 'HY_DIV_STABILITY':4,
-    # Quality 20
-    'HY_ROIC_WACC':8, 'HY_MARGIN_STAB':4, 'HY_F_SCORE':4, 'HY_ACCRUALS':4,
-    # Valuation 20
-    'HY_FCF_YIELD':8, 'HY_EV_EBITDA':6, 'HY_DY_5Y_Z':6,
-    # Momentum 10
-    'HY_TR_MOM_6M_SR':6, 'HY_REV_3M':4,
-    # Capital Return 5
-    'HY_NET_BUYBACK_YIELD':3, 'HY_DILUTION_FLAG':2,
+INDEX_SOURCES = {
+    "DAX 40 (.DE)": {
+        "url": "https://en.wikipedia.org/wiki/DAX",
+        "ticker_cols": ["Ticker symbol", "Ticker", "Symbol"],  # heuristisch
+        "suffix": ".DE",
+        "table_hint": "constituents",
+    },
+    "MDAX (.DE)": {
+        "url": "https://en.wikipedia.org/wiki/MDAX",
+        "ticker_cols": ["Ticker", "Symbol"],
+        "suffix": ".DE",
+        "table_hint": "constituents",
+    },
+    "SBF 120 (.PA)": {
+        "url": "https://en.wikipedia.org/wiki/SBF_120",
+        "ticker_cols": ["Ticker", "Symbol"],
+        "suffix": ".PA",
+        "table_hint": "constituents",
+    },
+    "FTSE 100 (.L)": {
+        "url": "https://en.wikipedia.org/wiki/FTSE_100_Index",
+        "ticker_cols": ["EPIC", "Ticker", "Symbol"],
+        "suffix": ".L",
+        "table_hint": "constituents",
+    },
+    "FTSE 250 (.L)": {
+        "url": "https://en.wikipedia.org/wiki/FTSE_250_Index",
+        "ticker_cols": ["EPIC", "Ticker", "Symbol"],
+        "suffix": ".L",
+        "table_hint": "constituents",
+    },
+    # Du kannst hier weitere Indizes ergänzen: IBEX 35 (.MC), FTSE MIB (.MI), AEX (.AS), SMI (.SW), OMX Stockholm (.ST), ...
 }
-FACTOR_DIR = {
-    'HY_YIELD_FWD': True, 'HY_FCF_COVER': True, 'HY_PAYOUT': False,
-    'HY_NETDEBT_EBITDA': False, 'HY_INT_COVERAGE': True, 'HY_DIV_STABILITY': True,
-    'HY_ROIC_WACC': True, 'HY_MARGIN_STAB': True, 'HY_F_SCORE': True, 'HY_ACCRUALS': False,
-    'HY_FCF_YIELD': True, 'HY_EV_EBITDA': True, 'HY_DY_5Y_Z': True,
-    'HY_TR_MOM_6M_SR': True, 'HY_REV_3M': True,
-    'HY_NET_BUYBACK_YIELD': True, 'HY_DILUTION_FLAG': False,
-    # Alternativen (werden in Free-Setup selten gefüllt, bleiben aber kompatibel)
-    'HY_EPS_COVER': True, 'HY_CET1': True, 'HY_SII': True, 'HY_AFFO_COVER': True,
-}
-
-ALL_FACTORS = tuple(DEFAULT_WEIGHTS.keys())
 
 # ─────────────────────────────────────────────────────────────
-# Sidebar – Eingaben inkl. Whitelist/Blacklist & Pruning
+# Sidebar – Parameter & Presets
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Einstellungen")
 
-    default_tickers = "AZN.L,BATS.L,ENEL.MI,ORA.PA,SAN.PA,ENI.MI,ALV.DE,EOAN.DE,VNA.DE,SHELL.AS,SU.PA,RI.PA,ULVR.L,IMB.L"
-    tickers_in = st.text_area(
-        "Ticker (kommagetrennt, Yahoo-Format)",
-        value=default_tickers,
-        height=100,
-        help="Suffixe beachten: .DE, .PA, .MI, .L, .SW, .AS, …",
+    # Index-Auswahl
+    idx_selected = st.multiselect(
+        "Index-Universen (Wikipedia live)",
+        options=list(INDEX_SOURCES.keys()),
+        default=["DAX 40 (.DE)", "SBF 120 (.PA)", "FTSE 100 (.L)"]
     )
 
-    hist_years = st.slider("Dividenden-Historie (Jahre) für 5y-Statistik", 3, 10, 5)
-    price_years = st.slider("Kurs-Historie (Jahre) für Momentum", 1, 10, 3)
+    # Manuelle Ticker & CSV
+    manual_tickers = st.text_area("Zusätzliche Ticker (kommagetrennt, Yahoo-Format)",
+                                  value="", help="z. B. ALV.DE,ENEL.MI,BATS.L")
+    csv_universe = st.file_uploader("Optional: CSV mit Spalte 'ticker' (weitere Titel)", type=["csv"])
 
+    # Screening-Parameter
     st.markdown("---")
-    # Pruning-Parameter
-    min_cov_pct = st.slider("Min. Datenabdeckung pro Spalte (%)", 0, 100, 20,
-                            help="Spalten mit geringerer Abdeckung werden entfernt.")
-    drop_constant = st.checkbox("Konstante Spalten entfernen", value=True,
-                                help="Entfernt Spalten mit nur einem (nicht-NaN) Wert.")
+    days_window = st.slider("Zeitfenster für 52W-Tief (Tage)", 3, 60, 7)
+    min_yield = st.slider("Mindest-DivR (TTM, % p.a.)", 0.0, 15.0, 5.0, step=0.5)
+    max_de = st.slider("Max. D/E (%)", 20, 300, 100, step=10)
+    near_low_pct = st.slider("Near-Low Schwelle (%)", 0.0, 10.0, 3.0, step=0.5,
+                             help="Abstand zum 52W-Tief ≤ X %")
 
+    # FX-Normalisierung
     st.markdown("---")
-    st.subheader("Faktoren wählen")
-    # Whitelist: initial alle (du kannst einzelne Faktoren abwählen)
-    whitelist = st.multiselect(
-        "Whitelist – nur diese Faktoren dürfen ins Scoring",
-        options=sorted(ALL_FACTORS),
-        default=sorted(ALL_FACTORS),
-    )
-    # Blacklist: optionale Subtraktion
-    blacklist = st.multiselect(
-        "Blacklist – diese Faktoren explizit ausschließen",
-        options=sorted(ALL_FACTORS),
-        default=[],
-        help="Wird von der Whitelist abgezogen.",
-    )
-    st.caption("Effektiv genutzt = Whitelist MINUS Blacklist. Nicht verfügbare Spalten werden automatisch ignoriert.")
+    base_ccy = st.selectbox("Berichtswährung (FX-Normalisierung)", ["EUR", "CHF"], index=0,
+                            help="Preise & Geldwerte in diese Währung umrechnen (DivR ist dimensionslos).")
+
+    # Presets
+    st.markdown("---")
+    st.subheader("Presets")
+    # Save preset
+    def current_preset_dict():
+        return {
+            "idx_selected": idx_selected,
+            "manual_tickers": manual_tickers,
+            "days_window": days_window,
+            "min_yield": float(min_yield),
+            "max_de": int(max_de),
+            "near_low_pct": float(near_low_pct),
+            "base_ccy": base_ccy,
+        }
+
+    preset_json = json.dumps(current_preset_dict(), indent=2)
+    st.download_button("Preset speichern (JSON)", data=preset_json,
+                       file_name="eu_screener_preset.json", mime="application/json")
+
+    preset_upload = st.file_uploader("Preset laden (JSON)", type=["json"], key="preset_upload")
+    if preset_upload is not None:
+        try:
+            p = json.load(preset_upload)
+            # SessionState aktualisieren, dann rerun
+            st.session_state["idx_selected"] = p.get("idx_selected", idx_selected)
+            st.session_state["manual_tickers"] = p.get("manual_tickers", manual_tickers)
+            st.session_state["days_window"] = p.get("days_window", days_window)
+            st.session_state["min_yield"] = p.get("min_yield", min_yield)
+            st.session_state["max_de"] = p.get("max_de", max_de)
+            st.session_state["near_low_pct"] = p.get("near_low_pct", near_low_pct)
+            st.session_state["base_ccy"] = p.get("base_ccy", base_ccy)
+            st.success("Preset geladen – bitte auf **Rerun** klicken (oben rechts) oder irgend­einen Parameter ändern.")
+        except Exception as e:
+            st.error(f"Preset konnte nicht geladen werden: {e}")
 
 # ─────────────────────────────────────────────────────────────
-# Helper: Normalisierung & Aggregation
+# Helper – Wikipedia Indizes parsEN
 # ─────────────────────────────────────────────────────────────
-def winsorize(s: pd.Series, lower=0.005, upper=0.995) -> pd.Series:
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_index_from_wikipedia(source: dict) -> List[str]:
+    """
+    Holt Ticker/EPIC/Symbole von einer Wikipedia-Seite und hängt Yahoo-Suffix an.
+    Robust: versucht mehrere Tabellen & Spaltennamen.
+    """
+    url = source["url"]
+    suffix = source["suffix"]
     try:
-        lo, hi = s.quantile(lower), s.quantile(upper)
-        return s.clip(lo, hi)
+        tables = pd.read_html(url)
     except Exception:
-        return s
+        return []
+    tickers: List[str] = []
+    for df in tables:
+        # Heuristik: wähle Tabellen mit vielen kapitalmarktnahen Spalten
+        cols_lower = [c.lower() for c in df.columns.astype(str)]
+        if "constituent" in source.get("table_hint", "") or any("constituent" in c for c in cols_lower):
+            pass  # ok
+        # Suche mögliche Ticker-Spalten
+        for colcand in source["ticker_cols"]:
+            if colcand in df.columns:
+                series = df[colcand].astype(str).str.strip()
+                vals = series[series.str.len() > 0].tolist()
+                if vals:
+                    tickers += vals
+                    break
+        # Falls nichts gefunden, versuche generisch
+        if not tickers:
+            for c in df.columns:
+                if str(c).lower() in ("ticker", "symbol", "epic"):
+                    vals = df[c].astype(str).str.strip().tolist()
+                    tickers += vals
+    # Säubern, Suffix anhängen
+    clean = []
+    for t in tickers:
+        t = t.replace(".", "").replace(" ", "").upper()
+        if t and t != "NAN":
+            clean.append(t + suffix)
+    # deduplizieren, Reihenfolge wahren
+    seen, out = set(), []
+    for t in clean:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
-def robust_zscore(s: pd.Series) -> pd.Series:
-    med = s.median(skipna=True)
-    mad = (s - med).abs().median(skipna=True)
-    if mad is None or not np.isfinite(mad) or mad <= 0:
-        denom = s.std(skipna=True) + 1e-9
-    else:
-        denom = 1.4826 * mad
-    out = (s - med) / (denom if denom != 0 else 1e-9)
-    return out.replace([np.inf, -np.inf], np.nan)
-
-def to_0_100(z: pd.Series, clip=3.0) -> pd.Series:
-    zc = z.clip(-clip, clip)
-    return (zc + clip) * (90.0 / (2*clip)) + 5.0
-
-def invert_if_needed(series: pd.Series, higher_is_better: bool) -> pd.Series:
-    return series if higher_is_better else -series
-
-def industry_neutralize(scores: pd.Series, industries: pd.Series) -> pd.Series:
-    df = pd.DataFrame({"score": scores, "ind": industries})
-    try:
-        adj = df.groupby("ind", dropna=False)["score"].transform(lambda x: x - x.mean())
-        return adj
-    except Exception:
-        return scores
+def build_universe(idx_selected: List[str], manual_tickers: str, csv_universe) -> List[str]:
+    ticks: List[str] = []
+    # Indizes
+    for name in idx_selected:
+        src = INDEX_SOURCES.get(name)
+        if src:
+            tks = fetch_index_from_wikipedia(src)
+            ticks += tks
+    # Manuell
+    if manual_tickers.strip():
+        ticks += [t.strip() for t in manual_tickers.split(",") if t.strip()]
+    # CSV
+    if csv_universe is not None:
+        try:
+            dfu = pd.read_csv(csv_universe)
+            if "ticker" in dfu.columns:
+                ticks += [str(x).strip() for x in dfu["ticker"].dropna().tolist()]
+        except Exception:
+            st.warning("CSV konnte nicht gelesen werden – erwarte eine Spalte 'ticker'.")
+    # Deduplizieren
+    seen, uniq = set(), []
+    for t in ticks:
+        if t not in seen:
+            seen.add(t); uniq.append(t)
+    return uniq
 
 # ─────────────────────────────────────────────────────────────
-# Datenabdeckung messen & Spalten prunen
+# Helper – FX-Raten (EZB) & Umrechnung
 # ─────────────────────────────────────────────────────────────
-def coverage_report(df: pd.DataFrame, min_cov: float = 0.2, drop_constant: bool = True) -> Tuple[pd.DataFrame, list[str]]:
-    if df.empty:
-        rep = pd.DataFrame(columns=["coverage","nunique","all_na","constant","dtype","keep"])
-        return rep, []
-    cov = df.notna().mean().rename("coverage")
-    nunq = df.nunique(dropna=True).rename("nunique")
-    all_na = df.isna().all().rename("all_na")
-    const = (nunq <= 1).rename("constant")
-    dtyp = df.dtypes.astype(str).rename("dtype")
-    rep = pd.concat([cov, nunq, all_na, const, dtyp], axis=1)
-    keep_mask = (~rep["all_na"]) & (rep["coverage"] >= float(min_cov))
-    if drop_constant:
-        keep_mask &= (~rep["constant"])
-    rep["keep"] = keep_mask
-    keep_cols = rep.index[rep["keep"]].tolist()
-    return rep.sort_values("coverage", ascending=False), keep_cols
+@st.cache_data(show_spinner=False, ttl=6*3600)
+def fetch_ecb_rates() -> Dict[str, float]:
+    """
+    Holt tägliche EUR-FX-Raten der EZB (eurofxref-daily.xml),
+    Rückgabe: Mapping CCY->EUR_RATE (z. B. {"USD":1.096, "CHF":0.96, ...} bedeutet: 1 EUR = 1.096 USD)
+    """
+    urls = [
+        "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml",
+        "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.xml",
+    ]
+    for u in urls:
+        try:
+            r = requests.get(u, timeout=10)
+            if r.ok:
+                txt = r.text
+                # primitive XML-Parse ohne extra deps
+                rates = {}
+                for token in txt.split(" Cube "):
+                    if 'currency="' in token and 'rate="' in token:
+                        try:
+                            ccy = token.split('currency="',1)[1].split('"',1)[0].upper()
+                            rate = float(token.split('rate="',1)[1].split('"',1)[0])
+                            rates[ccy] = rate
+                        except Exception:
+                            pass
+                if rates:
+                    rates["EUR"] = 1.0
+                    return rates
+        except Exception:
+            continue
+    return {"EUR": 1.0}  # Fallback
 
-def prune_columns(df: pd.DataFrame, min_cov: float = 0.2, drop_constant: bool = True,
-                  keep_always: list[str] | None = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    rep, keep_cols = coverage_report(df, min_cov=min_cov, drop_constant=drop_constant)
-    keep_always = keep_always or []
-    keep_cols = list({*keep_cols, *(c for c in keep_always if c in df.columns)})
-    return df[keep_cols].copy(), rep
+def fx_convert(amount: Optional[float], from_ccy: Optional[str], base_ccy: str, ecb: Dict[str, float]) -> Optional[float]:
+    if amount is None or from_ccy is None:
+        return None
+    from_ccy = from_ccy.upper()
+    base_ccy = base_ccy.upper()
+    if from_ccy == base_ccy:
+        return float(amount)
+    # Wir haben EUR-Rates: 1 EUR = ecb[CCY]
+    if base_ccy == "EUR":
+        # Betrag in CCY -> EUR: amount / (CCY per EUR)
+        rate = ecb.get(from_ccy)
+        if rate is None or rate == 0:
+            return None
+        return float(amount) / float(rate)
+    if base_ccy == "CHF":
+        eur_to_chf = ecb.get("CHF")
+        if eur_to_chf is None or eur_to_chf == 0:
+            return None
+        if from_ccy == "EUR":
+            return float(amount) * eur_to_chf
+        # CCY -> EUR -> CHF
+        rate = ecb.get(from_ccy)
+        if rate is None or rate == 0:
+            return None
+        eur_amt = float(amount) / float(rate)
+        return eur_amt * eur_to_chf
+    # Erweiterbar für andere Zielwährungen
+    return None
 
 # ─────────────────────────────────────────────────────────────
-# Yahoo Finance Fetcher
+# Yahoo-Fetches (Cache)
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def yf_price_hist(ticker: str, period_years: int) -> pd.DataFrame:
-    period = f"{period_years}y"
-    df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+def yf_price_hist(ticker: str, years: int = 2) -> pd.DataFrame:
+    df = yf.download(ticker, period=f"{years}y", auto_adjust=True, progress=False)
     return df
 
 @st.cache_data(show_spinner=False)
-def yf_dividends(ticker: str, period_years: int) -> pd.Series:
+def yf_dividends(ticker: str, years: int = 2) -> pd.Series:
     t = yf.Ticker(ticker)
-    div = t.dividends
-    if div is None or div.empty:
+    dv = t.dividends
+    if dv is None or dv.empty:
         return pd.Series(dtype=float)
-    cutoff = pd.Timestamp.today(tz=div.index.tz) - pd.DateOffset(years=period_years)
-    return div[div.index >= cutoff].sort_index()
+    cutoff = pd.Timestamp.today(tz=dv.index.tz) - pd.DateOffset(years=years)
+    return dv[dv.index >= cutoff].sort_index()
 
 @st.cache_data(show_spinner=False)
 def yf_fundamentals(ticker: str) -> dict:
     t = yf.Ticker(ticker)
-    fast = getattr(t, "fast_info", None)
-    price = fast.get("last_price") if fast else None
-    market_cap = fast.get("market_cap") if fast else None
-    shares_out = fast.get("shares") if fast else None
-    currency = fast.get("currency") if fast else None
+    fast = getattr(t, "fast_info", {}) or {}
+    price = fast.get("last_price")
+    currency = fast.get("currency")
+    market_cap = fast.get("market_cap")
+    shares_out = fast.get("shares")
 
     def last_from(df, names):
         if df is None or df.empty:
             return None
         for nm in names:
             if nm in df.index:
-                s = df.loc[nm]
-                s = pd.to_numeric(s, errors="coerce").dropna()
+                s = pd.to_numeric(df.loc[nm], errors="coerce").dropna()
                 if not s.empty:
                     return float(s.iloc[0])
         return None
 
-    try: fin = t.financials
-    except Exception: fin = None
     try: bs = t.balance_sheet
-    except Exception: bs = None
-    try: cf = t.cashflow
-    except Exception: cf = None
-
-    ebit = last_from(fin, ["Ebit", "EBIT"])
-    depam = last_from(cf, ["Depreciation And Amortization", "Depreciation", "Reconciled Depreciation"])
-    ebitda = last_from(fin, ["Ebitda", "EBITDA"])
-    if ebitda is None and ebit is not None and depam is not None:
-        ebitda = ebit + depam
-
-    interest_expense = last_from(fin, ["Interest Expense"])
-    if interest_expense is not None:
-        interest_expense = abs(interest_expense)
+    except Exception: bs = pd.DataFrame()
 
     total_debt = last_from(bs, ["Total Debt", "Short Long Term Debt", "Long Term Debt"])
-    cash_eq = last_from(bs, ["Cash And Cash Equivalents", "Cash"])
-    net_debt = (total_debt - cash_eq) if (total_debt is not None and cash_eq is not None) else None
-
-    cfo = last_from(cf, ["Cash From Operating Activities", "Operating Cash Flow"])
-    capex = last_from(cf, ["Capital Expenditure", "Investments in PPE", "Capital Expenditures"])
-    fcf_ttm = (cfo - abs(capex)) if (cfo is not None and capex is not None) else None
-
-    net_income = last_from(fin, ["Net Income"])
-    total_assets = last_from(bs, ["Total Assets"])
-    avg_total_assets = float(total_assets) if total_assets is not None else None
+    total_equity = last_from(bs, ["Total Stockholder Equity", "Stockholders Equity"])
 
     return {
-        "ticker": ticker,
         "price": price,
+        "currency": currency,
         "market_cap": market_cap,
         "shares_outstanding_ttm": shares_out,
-        "currency": currency,
-        "ebit": ebit,
-        "ebitda": ebitda,
-        "interest_expense": interest_expense,
         "total_debt": total_debt,
-        "cash_and_equivalents": cash_eq,
-        "net_debt": net_debt,
-        "cfo": cfo,
-        "capex": capex,
-        "fcf_ttm": fcf_ttm,
-        "div_cash_paid_ttm": None,  # selten zuverlässig frei verfügbar
-        "net_income": net_income,
-        "avg_total_assets": avg_total_assets,
+        "total_equity": total_equity,
     }
 
-def compute_ttm_dps(div_series: pd.Series) -> float:
+# ─────────────────────────────────────────────────────────────
+# Kennzahlenberechnung
+# ─────────────────────────────────────────────────────────────
+def ttm_dividend(div_series: pd.Series) -> Optional[float]:
     if div_series is None or div_series.empty:
-        return np.nan
+        return None
     end = div_series.index.max()
     start = end - pd.Timedelta(days=365)
     return float(div_series[(div_series.index > start) & (div_series.index <= end)].sum())
 
-def dy_5y_stats(ticker: str, years: int = 5) -> tuple[float, float]:
-    px = yf_price_hist(ticker, period_years=years)
-    dv = yf_dividends(ticker, period_years=years+1)
-    if px is None or px.empty or dv is None:
-        return (np.nan, np.nan)
-    mpx = px["Close"].resample("M").last()
-    dv_m = dv.resample("M").sum()
-    dv_12m = dv_m.rolling(window=12, min_periods=1).sum()
-    yld = (dv_12m / mpx).replace([np.inf, -np.inf], np.nan).dropna()
-    if yld.empty:
-        return (np.nan, np.nan)
-    return (float(yld.mean()), float(yld.std(ddof=0)))
-
-def momentum_6m(ticker: str, years: int = 3) -> tuple[float, float]:
-    px = yf_price_hist(ticker, period_years=years)
+def compute_52w_low(px: pd.DataFrame) -> Tuple[Optional[pd.Timestamp], Optional[float], Optional[float]]:
     if px is None or px.empty:
-        return (np.nan, np.nan)
-    six_months = int(252/2)
-    if len(px) < six_months + 1:
-        return (np.nan, np.nan)
-    ret_6m = px["Close"].iloc[-1] / px["Close"].iloc[-(six_months+1)] - 1.0
-    last6 = px["Close"].pct_change().dropna().iloc[-six_months:]
-    vol_6m = float(last6.std(ddof=0) * np.sqrt(252)) if not last6.empty else np.nan
-    return (float(ret_6m), vol_6m)
+        return None, None, None
+    cutoff = px.index.max() - pd.Timedelta(days=365)
+    sub = px[px.index >= cutoff]
+    if sub.empty:
+        return None, None, None
+    low_close = float(sub["Close"].min())
+    low_date = sub["Close"].idxmin()
+    last_close = float(sub["Close"].iloc[-1])
+    return low_date, low_close, last_close
+
+def qualifies_low_within_window(low_date: Optional[pd.Timestamp], days: int) -> bool:
+    if low_date is None:
+        return False
+    now = pd.Timestamp.now(tz=getattr(low_date, "tz", None))
+    return (now - low_date) <= pd.Timedelta(days=days)
+
+def compute_de_ratio(total_debt: Optional[float], total_equity: Optional[float]) -> Optional[float]:
+    if total_debt is None or total_equity is None or total_equity == 0:
+        return None
+    if total_equity <= 0:
+        return math.inf
+    return float(total_debt / total_equity)
 
 # ─────────────────────────────────────────────────────────────
-# Faktoren (Free-Daten)
+# Screening-Logik
 # ─────────────────────────────────────────────────────────────
-def compute_factors_from_free(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
-
-    if set(['dps_ntm','price']).issubset(df.columns):
-        out['HY_YIELD_FWD'] = (df['dps_ntm'] / df['price']).replace([np.inf, -np.inf], np.nan)
-
-    if 'fcf_ttm' in df.columns:
-        div_paid = df['div_cash_paid_ttm'] if 'div_cash_paid_ttm' in df.columns else np.nan
-        out['HY_FCF_COVER'] = (df['fcf_ttm'] / pd.to_numeric(div_paid).replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-
-    if set(['eps_norm_ttm','dps_ntm']).issubset(df.columns):
-        out['HY_EPS_COVER'] = (df['eps_norm_ttm'] / df['dps_ntm'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-        out['HY_PAYOUT']    = (df['dps_ntm'] / df['eps_norm_ttm'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-
-    if set(['net_debt','ebitda']).issubset(df.columns):
-        out['HY_NETDEBT_EBITDA'] = (df['net_debt'] / df['ebitda'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-
-    if set(['ebit','interest_expense']).issubset(df.columns):
-        out['HY_INT_COVERAGE'] = (df['ebit'] / df['interest_expense'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-
-    if set(['net_income','cfo','avg_total_assets']).issubset(df.columns):
-        out['HY_ACCRUALS'] = ((df['net_income'] - df['cfo']) / df['avg_total_assets']).replace([np.inf, -np.inf], np.nan)
-
-    if set(['fcf_ttm','market_cap']).issubset(df.columns):
-        out['HY_FCF_YIELD'] = (df['fcf_ttm'] / df['market_cap'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-
-    if 'ev_to_ebitda' in df.columns:
-        out['HY_EV_EBITDA'] = (1.0 / df['ev_to_ebitda'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-
-    if set(['dy_5y_avg','dy_5y_std','dps_ntm','price']).issubset(df.columns):
-        out['HY_DY_5Y_Z'] = ((df['dps_ntm'] / df['price']) - df['dy_5y_avg']) / (df['dy_5y_std'] + 1e-9)
-
-    if set(['ret_6m','vol_6m']).issubset(df.columns):
-        out['HY_TR_MOM_6M_SR'] = df['ret_6m'] / (df['vol_6m'] + 1e-9)
-
-    if set(['shares_outstanding_ttm','shares_outstanding_1y']).issubset(df.columns):
-        chg = (df['shares_outstanding_ttm'] - df['shares_outstanding_1y']) / (df['shares_outstanding_1y'] + 1e-9)
-        out['HY_NET_BUYBACK_YIELD'] = -chg
-        out['HY_DILUTION_FLAG'] = (chg > 0.05).astype(float)
-
-    return out
-
-def kill_switch_free(df: pd.DataFrame, factors: pd.DataFrame) -> pd.Series:
-    ks = pd.Series(False, index=df.index)
-    if {'HY_FCF_COVER','HY_NETDEBT_EBITDA','HY_INT_COVERAGE'}.issubset(factors.columns):
-        cond_nf = (factors['HY_FCF_COVER'] < 0.8) & ((factors['HY_NETDEBT_EBITDA'] > 3.0) | (factors['HY_INT_COVERAGE'] < 2.0))
-        ks = ks | cond_nf.fillna(False)
-    return ks
-
-def aggregate_scores(
-    factors: pd.DataFrame,
-    industries: pd.Series,
-    weights: dict,
-    factor_dir: dict,
-) -> pd.DataFrame:
-    norm = pd.DataFrame(index=factors.index)
-    for f, w in weights.items():
-        if w == 0 or f not in factors.columns:
-            continue
-        s = pd.to_numeric(factors[f], errors="coerce")
-        s = winsorize(s, 0.005, 0.995)
-        z = robust_zscore(s)
-        s01 = to_0_100(invert_if_needed(z, factor_dir.get(f, True)))
-        if f in ['HY_YIELD_FWD','HY_FCF_COVER','HY_PAYOUT','HY_NETDEBT_EBITDA','HY_FCF_YIELD','HY_EV_EBITDA']:
-            s01 = industry_neutralize(s01, industries) + 50.0
-        norm[f] = s01
-
-    total_weight = float(sum([w for w in weights.values() if w > 0]))
-    hy_score = sum(norm[f] * (weights[f] / total_weight) for f in norm.columns if f in weights)
-    res = pd.DataFrame({'HY_Score': hy_score.clip(0, 100)}, index=factors.index)
-
-    def subtotal(fs):
-        present = [x for x in fs if x in norm.columns and weights.get(x,0) > 0]
-        if not present:
-            return pd.Series(index=factors.index, data=np.nan)
-        wsum = sum(weights[x] for x in present)
-        return sum(norm[x] * (weights[x] / wsum) for x in present)
-
-    res['P_Sustainability'] = subtotal(['HY_YIELD_FWD','HY_FCF_COVER','HY_PAYOUT','HY_NETDEBT_EBITDA','HY_INT_COVERAGE','HY_DIV_STABILITY'])
-    res['P_Quality']        = subtotal(['HY_ROIC_WACC','HY_MARGIN_STAB','HY_F_SCORE','HY_ACCRUALS'])
-    res['P_Valuation']      = subtotal(['HY_FCF_YIELD','HY_EV_EBITDA','HY_DY_5Y_Z'])
-    res['P_Momentum']       = subtotal(['HY_TR_MOM_6M_SR','HY_REV_3M'])
-    res['P_CapitalReturn']  = subtotal(['HY_NET_BUYBACK_YIELD','HY_DILUTION_FLAG'])
-    return res.join(norm.add_prefix("F_"))
-
-# ─────────────────────────────────────────────────────────────
-# Pipeline: Ticker -> Free-Daten -> Faktoren -> Pruning -> Score
-# ─────────────────────────────────────────────────────────────
-def build_dataset_from_yf(tickers: list[str], hist_years: int, price_years: int) -> pd.DataFrame:
-    records = []
+def screen_tickers(tickers: List[str], days_window: int, min_yield_pct: float, max_de_pct: float,
+                   base_ccy: str, ecb_rates: Dict[str,float]) -> pd.DataFrame:
+    rows = []
     for tk in tickers:
-        tk = tk.strip()
-        if not tk:
-            continue
-        with st.spinner(f"Lade Daten für {tk} …"):
-            div = yf_dividends(tk, period_years=hist_years+1)
-            dps_ttm = compute_ttm_dps(div)
-            dy_avg, dy_std = dy_5y_stats(tk, years=hist_years)
-            r6m, v6m = momentum_6m(tk, years=price_years)
-            f = yf_fundamentals(tk)
+        with st.spinner(f"Lade: {tk}"):
+            try:
+                px = yf_price_hist(tk, years=2)
+                dv = yf_dividends(tk, years=2)
+                f = yf_fundamentals(tk)
+            except Exception:
+                continue
 
-            ev = None
-            if f.get("market_cap") is not None:
-                ev = f["market_cap"]
-                if f.get("total_debt") is not None:
-                    ev += f["total_debt"]
-                if f.get("cash_and_equivalents") is not None:
-                    ev -= f["cash_and_equivalents"]
-            ev_to_ebitda = None
-            if ev is not None and f.get("ebitda"):
-                if f["ebitda"] != 0:
-                    ev_to_ebitda = ev / f["ebitda"]
+            price = f.get("price")
+            currency = f.get("currency")
+            # Fallback Preis
+            if price is None and px is not None and not px.empty:
+                price = float(px["Close"].iloc[-1])
 
-            eps_norm_ttm = None
-            if f.get("net_income") is not None and f.get("shares_outstanding_ttm"):
-                try:
-                    eps_norm_ttm = f["net_income"] / float(f["shares_outstanding_ttm"])
-                except Exception:
-                    eps_norm_ttm = None
+            # FX-Preis in Basis
+            price_base = fx_convert(price, currency, base_ccy, ecb_rates) if price is not None else None
 
-            records.append({
+            # DivR (CCY-neutral, da in gleicher CCY)
+            dps_ttm = ttm_dividend(dv)
+            div_yield = None
+            if dps_ttm is not None and price not in (None, 0):
+                div_yield = float(dps_ttm / price)
+
+            # D/E
+            de_ratio = compute_de_ratio(f.get("total_debt"), f.get("total_equity"))
+
+            # 52W-Low
+            low_date, low_close, last_close = compute_52w_low(px)
+            low_within = qualifies_low_within_window(low_date, days_window)
+            gap_to_low_pct = None
+            if low_close not in (None, 0) and last_close not in (None, 0):
+                gap_to_low_pct = 100.0 * (last_close - low_close) / low_close
+
+            rows.append({
                 "ticker": tk,
-                "price": f.get("price"),
-                "market_cap": f.get("market_cap"),
-                "shares_outstanding_ttm": f.get("shares_outstanding_ttm"),
-                "shares_outstanding_1y": np.nan,  # meist nicht frei verfügbar
-                "currency": f.get("currency"),
-                "dps_ntm": dps_ttm,  # Proxy: TTM als NTM
-                "fcf_ttm": f.get("fcf_ttm"),
-                "div_cash_paid_ttm": f.get("div_cash_paid_ttm"),
-                "net_debt": f.get("net_debt"),
-                "ebitda": f.get("ebitda"),
-                "ebit": f.get("ebit"),
-                "interest_expense": f.get("interest_expense"),
-                "ev_to_ebitda": ev_to_ebitda,
-                "dy_5y_avg": dy_avg,
-                "dy_5y_std": dy_std,
-                "ret_6m": r6m,
-                "vol_6m": v6m,
-                "eps_norm_ttm": eps_norm_ttm,
-                "cfo": f.get("cfo"),
-                "net_income": f.get("net_income"),
-                "avg_total_assets": f.get("avg_total_assets"),
-                "sector": "",
-                "industry": "",
+                "currency": currency,
+                "price": price,
+                f"price_{base_ccy}": price_base,
+                "div_ttm": dps_ttm,
+                "div_yield": div_yield,  # 0.065 = 6.5%
+                "de_ratio": de_ratio,    # 0.8 = 80%
+                "low_date": low_date,
+                "low_close": low_close,
+                "last_close": last_close,
+                "gap_to_low_%": gap_to_low_pct,
+                "low_within_window": low_within,
+                "yahoo": f"https://finance.yahoo.com/quote/{tk}",
+                "ft": f"https://markets.ft.com/data/equities/tearsheet/summary?s={tk.replace('.', '%3A')}",
+                "reuters": f"https://www.reuters.com/markets/companies/{tk}/",
             })
 
-    df = pd.DataFrame.from_records(records).set_index("ticker")
-    return df
-
-# ─────────────────────────────────────────────────────────────
-# Run
-# ─────────────────────────────────────────────────────────────
-tickers = [t.strip() for t in tickers_in.split(",") if t.strip()]
-
-if st.button("Daten laden & scoren", type="primary"):
-    base = build_dataset_from_yf(tickers, hist_years=hist_years, price_years=price_years)
+    base = pd.DataFrame.from_records(rows).set_index("ticker")
     if base.empty:
-        st.warning("Keine Daten geladen. Prüfe Ticker/Suffixe.")
-        st.stop()
+        return base
 
-    st.subheader("Rohdaten (Free-Daten, best effort)")
-    st.dataframe(base, use_container_width=True)
+    # Filter anwenden
+    elig = base.copy()
+    elig = elig[elig["low_within_window"] == True]
+    if min_yield_pct is not None:
+        elig = elig[(elig["div_yield"].fillna(0) >= (min_yield_pct / 100.0))]
+    if max_de_pct is not None:
+        elig = elig[np.isfinite(elig["de_ratio"].astype(float))]
+        elig = elig[(elig["de_ratio"] <= (max_de_pct / 100.0))]
 
-    # Faktoren & Pruning
-    factors = compute_factors_from_free(base)
-    factors_pruned, fac_rep = prune_columns(
-        factors,
-        min_cov=min_cov_pct / 100.0,
-        drop_constant=drop_constant
-    )
-    with st.expander("Datenabdeckung (Faktoren)"):
-        st.dataframe(fac_rep.style.format({"coverage": "{:.0%}"}), use_container_width=True)
+    return elig
 
-    # Effektive Faktor-Auswahl (Whitelist – Blacklist – Pruning)
-    selected = [f for f in whitelist if f not in blacklist]
-    available = list(factors_pruned.columns)
-    effective = sorted([f for f in selected if f in available])
-
-    st.success(f"Faktoren genutzt (nach Whitelist/Blacklist & Pruning): {', '.join(effective) if effective else '—'}")
-
-    # Gewichte auf Basis der Auswahl setzen (nicht gewählte => Gewicht 0)
-    weights_eff = DEFAULT_WEIGHTS.copy()
-    for f in list(weights_eff.keys()):
-        if f not in effective:
-            weights_eff[f] = 0
-
-    # Scoring
-    scores = aggregate_scores(factors_pruned, industries=base.get("industry", pd.Series(index=base.index, data="")),
-                              weights=weights_eff, factor_dir=FACTOR_DIR)
-    kills = kill_switch_free(base, factors_pruned)
-
-    # Ergebnis
-    res = base.join(factors_pruned, how="left").join(scores, how="left")
-    res["Kill_Switch"] = kills
-
-    keep_always = ["price", "currency", "sector", "industry", "HY_Score", "Kill_Switch"]
-    res_pruned, res_rep = prune_columns(
-        res,
-        min_cov=min_cov_pct / 100.0,
-        drop_constant=drop_constant,
-        keep_always=keep_always
-    )
-    with st.expander("Datenabdeckung (Gesamtausgabe)"):
-        st.dataframe(res_rep.style.format({"coverage": "{:.0%}"}), use_container_width=True)
-
-    st.subheader("Ranking")
-    eligible = res_pruned[~res_pruned["Kill_Switch"]].copy()
-    ranked = eligible.sort_values("HY_Score", ascending=False)
-
-    st.markdown("**Top 25 (Kill-Switch gefiltert):**")
-    st.dataframe(ranked.head(25), use_container_width=True)
-
-    # ─────────────────────────────────────────────────────────
-    # Downloads (robust, ohne Absturz)
-    # ─────────────────────────────────────────────────────────
-    st.subheader("Download")
-
-    def df_to_bytes(df: pd.DataFrame, kind: str = "csv"):
-        if kind == "csv":
-            return df.to_csv(index=True).encode("utf-8"), None
-        if kind == "html":
-            return df.to_html(index=True).encode("utf-8"), None
-        if kind == "xlsx":
-            bio = io.BytesIO()
-            engine = None
+# ─────────────────────────────────────────────────────────────
+# Exporte
+# ─────────────────────────────────────────────────────────────
+def df_to_bytes(df: pd.DataFrame, kind: str = "csv"):
+    if kind == "csv":
+        return df.to_csv(index=True).encode("utf-8"), None
+    if kind == "html":
+        return df.to_html(index=True).encode("utf-8"), None
+    if kind == "xlsx":
+        bio = io.BytesIO()
+        engine = None
+        try:
+            import xlsxwriter  # noqa: F401
+            engine = "xlsxwriter"
+        except Exception:
+            pass
+        if engine is None:
             try:
-                import xlsxwriter  # noqa: F401
-                engine = "xlsxwriter"
+                import openpyxl  # noqa: F401
+                engine = "openpyxl"
             except Exception:
-                pass
-            if engine is None:
-                try:
-                    import openpyxl  # noqa: F401
-                    engine = "openpyxl"
-                except Exception:
-                    return None, "Excel-Export deaktiviert: installiere 'xlsxwriter' oder 'openpyxl'."
-            with pd.ExcelWriter(bio, engine=engine) as xw:
-                df.to_excel(xw, index=True, sheet_name="scores")
-            return bio.getvalue(), None
-        return None, f"Unbekanntes Format: {kind}"
+                return None, "Excel-Export: installiere 'xlsxwriter' oder 'openpyxl'."
+        with pd.ExcelWriter(bio, engine=engine) as xw:
+            df.to_excel(xw, index=True, sheet_name="screen")
+        return bio.getvalue(), None
+    return None, f"Unbekanntes Format: {kind}"
 
-    c1, c2, c3 = st.columns(3)
+# ─────────────────────────────────────────────────────────────
+# Heatmap-Helper
+# ─────────────────────────────────────────────────────────────
+def build_heatmap_df(df: pd.DataFrame, near_low_thresh: float) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
 
-    csv_bytes, _ = df_to_bytes(ranked, "csv")
-    c1.download_button("CSV herunterladen", data=csv_bytes, file_name="hy_scores.csv", mime="text/csv")
+    # Kennzahlen (in % für Anzeige)
+    out["DivR_%"] = (out["div_yield"] * 100.0).round(2)
+    out["D/E_%"] = (out["de_ratio"] * 100.0).round(1)
+    out["NearLow_%"] = out["gap_to_low_%"].round(2)
 
-    xlsx_bytes, xlsx_err = df_to_bytes(ranked, "xlsx")
-    if xlsx_bytes is not None:
-        c2.download_button(
-            "Excel herunterladen",
-            data=xlsx_bytes,
-            file_name="hy_scores.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    else:
-        c2.info(xlsx_err)
-
-    html_bytes, _ = df_to_bytes(ranked, "html")
-    c3.download_button("HTML herunterladen", data=html_bytes, file_name="hy_scores.html", mime="text/html")
-
-    # Hinweise
-    st.info(
-        "Hinweise:\n"
-        "- Forward DPS wird als TTM-Dividende angenähert (Europa: halb-/jährliche Zahler). "
-        "Bei Sonderdividenden ggf. manuell adjustieren.\n"
-        "- EV/EBITDA, FCF & weitere Fundamentals sind frei nicht immer verfügbar → Spalten-Pruning hält die Tabellen sauber.\n"
-        "- Whitelist/Blacklist steuern, welche Faktoren überhaupt ins Scoring einfließen; fehlende Spalten werden automatisch ignoriert."
+    # Buckets
+    out["DivR_bucket"] = pd.cut(
+        out["DivR_%"],
+        bins=[-np.inf, 3, 5, 7, 10, np.inf],
+        labels=["<3", "3–5", "5–7", "7–10", "≥10"]
     )
-else:
-    st.caption("Bereit. Ticker prüfen und **Daten laden & scoren** klicken.")
+    out["DE_bucket"] = pd.cut(
+        out["D/E_%"],
+        bins=[-np.inf, 30, 60, 100, 150, np.inf],
+        labels=["≤30", "30–60", "60–100", "100–150", ">150"]
+    )
+    out["NearLow_bucket"] = pd.cut(
+        out["NearLow_%"],
+        bins=[-np.inf, near_low_thresh, 5, 10, 20, np.inf],
+        labels=[f"≤{near_low_thresh:.1f}", "≤5", "≤10", "≤20", ">20"]
+    )
+
+    # Für Heatmap-Legende: Scorings (höher = „besser“)
+    # DivR: höher besser; NearLow: niedriger besser; D/E: niedriger besser
+    def score_divr(x):
+        if pd.isna(x): return np.nan
+        if x >= 10: return 5
+        if x >= 7: return 4
+        if x >= 5: return 3
+        if x >= 3: return 2
+        return 1
+
+    def score_nearlow(x):
+        if pd.isna(x): return np.nan
+        if x <= near_low_thresh: return 5
+        if x <= 5: return 4
+        if x <= 10: return 3
+        if x <= 20: return 2
+        return 1
+
+    def score_de(x):
+        if pd.isna(x): return np.nan
+        if x <= 30: return 5
+        if x <= 60: return 4
+        if x <= 100: return 3
+        if x <= 150: return 2
+        return 1
+
+    out["DivR_score"] = out["DivR_%"].apply(score_divr)
+    out["NearLow_score"] = out["NearLow_%"].apply(score_nearlow)
+    out["DE_score"] = out["D/E_%"].apply(score_de)
+
+    # Long-Format für Altair
+    hm = out.reset_index()[["ticker","DivR_score","NearLow_score","DE_score"]]
+    hm = hm.melt(id_vars="ticker", var_name="Metric", value_name="Score")
+    return out, hm
+
+def heatmap_chart(hm_long: pd.DataFrame, title: str):
+    if hm_long.empty:
+        return None
+    chart = alt.Chart(hm_long).mark_rect().encode(
+        y=alt.Y('ticker:N', sort='-x', title="Ticker"),
+        x=alt.X('Metric:N', title="Metric"),
+        color=alt.Color('Score:Q', scale=alt.Scale(scheme='yellowgreenblue'), legend=alt.Legend(title="Score")),
+        tooltip=['ticker:N','Metric:N','Score:Q']
+    ).properties(width=420, height=20 * max(3, hm_long["ticker"].nunique()), title=title)
+    return chart
+
+# ─────────────────────────────────────────────────────────────
+# Tabs
+# ─────────────────────────────────────────────────────────────
+tab1, tab2 = st.tabs(["🎯 Screener", "📊 Daily Research + Heatmap"])
+
+# Gemeinsame Vorarbeit: Universum & FX
+with st.spinner("Lade EZB-Kurse …"):
+    ecb_rates = fetch_ecb_rates()
+
+universe = build_universe(idx_selected, manual_tickers, csv_universe)
+
+with tab1:
+    st.subheader("Screening nach Regeln")
+    st.write(f"Universum: **{len(universe)}** Ticker aus {', '.join(idx_selected) or '—'} "
+             f"{'+ manuell/CSV' if (manual_tickers.strip() or csv_universe is not None) else ''}")
+
+    if st.button("Screen ausführen", type="primary"):
+        hits = screen_tickers(universe, days_window, min_yield, max_de, base_ccy, ecb_rates)
+        if hits.empty:
+            st.warning("Keine Treffer für die aktuellen Regeln.")
+        else:
+            view = hits.copy()
+            view[f"price_{base_ccy}"] = view[f"price_{base_ccy}"].round(4)
+            view["DivR_%"] = (view["div_yield"] * 100.0).round(2)
+            view["D/E_%"] = (view["de_ratio"] * 100.0).round(1)
+            show_cols = [c for c in [f"price_{base_ccy}","DivR_%","D/E_%","low_date","low_close","last_close","gap_to_low_%","yahoo","ft","reuters"] if c in view.columns]
+            st.dataframe(view[show_cols].sort_values("DivR_%", ascending=False), use_container_width=True)
+
+            # Downloads
+            st.markdown("#### Download")
+            c1, c2, c3 = st.columns(3)
+            csv_b, _ = df_to_bytes(hits, "csv")
+            c1.download_button("CSV", data=csv_b, file_name="eu_screen_hits.csv", mime="text/csv")
+            x_b, x_err = df_to_bytes(hits, "xlsx")
+            if x_b:
+                c2.download_button("Excel", data=x_b, file_name="eu_screen_hits.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                c2.info(x_err)
+            h_b, _ = df_to_bytes(hits, "html")
+            c3.download_button("HTML", data=h_b, file_name="eu_screen_hits.html", mime="text/html")
+
+        st.info("Tipp: Erhöhe das Zeitfenster (z. B. 14–30 Tage) oder lockere D/E auf 150 %, falls 5+ Treffer gewünscht sind.")
+
+with tab2:
+    st.subheader("Daily Research Dashboard")
+    if st.button("Dashboard laden / aktualisieren"):
+        # Für das Dashboard zunächst die Basis-Metriken ohne harte Filter berechnen
+        rows = []
+        for tk in universe:
+            with st.spinner(f"Berechne: {tk}"):
+                try:
+                    px = yf_price_hist(tk, years=2)
+                    dv = yf_dividends(tk, years=2)
+                    f = yf_fundamentals(tk)
+                except Exception:
+                    continue
+                price = f.get("price")
+                currency = f.get("currency")
+                if price is None and px is not None and not px.empty:
+                    price = float(px["Close"].iloc[-1])
+                price_base = fx_convert(price, currency, base_ccy, ecb_rates) if price is not None else None
+
+                dps_ttm = ttm_dividend(dv)
+                div_yield = None
+                if dps_ttm is not None and price not in (None, 0):
+                    div_yield = float(dps_ttm / price)
+
+                de_ratio = compute_de_ratio(f.get("total_debt"), f.get("total_equity"))
+                low_date, low_close, last_close = compute_52w_low(px)
+                gap_to_low_pct = None
+                if low_close not in (None, 0) and last_close not in (None, 0):
+                    gap_to_low_pct = 100.0 * (last_close - low_close) / low_close
+
+                rows.append({
+                    "ticker": tk,
+                    "currency": currency,
+                    "price": price,
+                    f"price_{base_ccy}": price_base,
+                    "div_ttm": dps_ttm,
+                    "div_yield": div_yield,
+                    "de_ratio": de_ratio,
+                    "low_date": low_date,
+                    "low_close": low_close,
+                    "last_close": last_close,
+                    "gap_to_low_%": gap_to_low_pct,
+                    "yahoo": f"https://finance.yahoo.com/quote/{tk}",
+                })
+
+        base = pd.DataFrame.from_records(rows).set_index("ticker")
+        if base.empty:
+            st.warning("Keine Daten geladen.")
+            st.stop()
+
+        # KPIs
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Anzahl Ticker", len(base))
+        c2.metric("mit DivR", int(base["div_yield"].notna().sum()))
+        c3.metric("mit D/E", int(base["de_ratio"].replace([np.inf, -np.inf], np.nan).notna().sum()))
+        c4.metric(f"Near-Lows ≤ {near_low_pct:.1f} %", int((base["gap_to_low_%"].notna()) & (base["gap_to_low_%"] <= near_low_pct)))
+
+        # Tabellen
+        st.markdown("#### Top-Yielder")
+        top = base[base["div_yield"].notna()].copy()
+        top[f"price_{base_ccy}"] = top[f"price_{base_ccy}"].round(4)
+        top["DivR_%"] = (top["div_yield"] * 100.0).round(2)
+        st.dataframe(top.sort_values("div_yield", ascending=False).head(25)[[f"price_{base_ccy}","DivR_%","low_date","yahoo"]], use_container_width=True)
+
+        st.markdown(f"#### Near-Lows (≤ {near_low_pct:.1f} %)")
+        near = base.copy()
+        near = near[near["gap_to_low_%"].notna() & (near["gap_to_low_%"] <= near_low_pct)]
+        st.dataframe(near.sort_values("gap_to_low_%")[[f"price_{base_ccy}","gap_to_low_%","low_date","yahoo"]], use_container_width=True)
+
+        st.markdown("#### D/E < 100 % & DivR > 5 % (Quick-View)")
+        quick = base.copy()
+        quick = quick[quick["div_yield"].fillna(0) >= 0.05]
+        quick = quick[np.isfinite(quick["de_ratio"].astype(float))]
+        quick = quick[quick["de_ratio"] <= 1.0]
+        quick["DivR_%"] = (quick["div_yield"] * 100.0).round(2)
+        quick["D/E_%"] = (quick["de_ratio"] * 100.0).round(1)
+        st.dataframe(quick.sort_values("DivR_%", ascending=False)[[f"price_{base_ccy}","DivR_%","D/E_%","low_date","yahoo"]], use_container_width=True)
+
+        # Heatmap
+        st.markdown("#### Watchlist-Heatmap (DivR / Near-Low / D/E – Bucket-Scores)")
+        enriched, hm_long = build_heatmap_df(base, near_low_thresh=near_low_pct)
+        ch = heatmap_chart(hm_long, title="Score-Heatmap: 5=best, 1=schwach")
+        if ch is not None:
+            st.altair_chart(ch, use_container_width=True)
+
+        # Downloads (Dashboard-Exports)
+        st.markdown("#### Dashboard-Downloads")
+        c1, c2, c3 = st.columns(3)
+        b1, _ = df_to_bytes(top, "csv"); c1.download_button("Top-Yielder CSV", data=b1, file_name="dashboard_top_yielder.csv", mime="text/csv")
+        b2, _ = df_to_bytes(near, "csv"); c2.download_button("Near-Lows CSV", data=b2, file_name="dashboard_near_lows.csv", mime="text/csv")
+        b3, _ = df_to_bytes(quick, "csv"); c3.download_button("D_E_und_DivR CSV", data=b3, file_name="dashboard_de_divr.csv", mime="text/csv")
+    else:
+        st.info("Parameter links einstellen und **Dashboard laden / aktualisieren** klicken.")

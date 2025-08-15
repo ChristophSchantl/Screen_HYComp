@@ -628,11 +628,20 @@ with tab2:
             st.warning("Keine Daten geladen.")
             st.stop()
 
+        # KPIs (robust)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Anzahl Ticker", len(base))
-        c2.metric("mit DivR", int(base["div_yield"].notna().sum()))
-        c3.metric("mit D/E", int(base["de_ratio"].replace([np.inf, -np.inf], np.nan).notna().sum()))
-        c4.metric(f"Near-Lows ≤ {near_low_pct:.1f} %", int((base["gap_to_low_%"].notna()) & (base["gap_to_low_%"] <= near_low_pct)))
+        
+        divr_count = int(base["div_yield"].notna().sum())
+        c2.metric("mit DivR", divr_count)
+        
+        de_series = pd.to_numeric(base["de_ratio"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        c3.metric("mit D/E", int(de_series.notna().sum()))
+        
+        gap_series = pd.to_numeric(base["gap_to_low_%"], errors="coerce")
+        near_low_count = int(((gap_series.notna()) & (gap_series <= near_low_pct)).sum())
+        c4.metric(f"Near-Lows ≤ {near_low_pct:.1f} %", near_low_count)
+
 
         st.markdown("#### Top-Yielder")
         top = base[base["div_yield"].notna()].copy()
@@ -643,10 +652,14 @@ with tab2:
                      [[f"price_{base_ccy}","DivR_%","low_date","yahoo"]], use_container_width=True)
 
         st.markdown(f"#### Near-Lows (≤ {near_low_pct:.1f} %)")
-        near = base.copy()
-        near = near[near["gap_to_low_%"].notna() & (near["gap_to_low_%"] <= near_low_pct)]
-        st.dataframe(near.sort_values("gap_to_low_%")
-                     [[f"price_{base_ccy}","gap_to_low_%","low_date","yahoo"]], use_container_width=True)
+        gap_series = pd.to_numeric(base["gap_to_low_%"], errors="coerce")
+        near = base[gap_series.le(near_low_pct)].copy()
+        near["gap_to_low_%"] = gap_series.loc[near.index]
+        st.dataframe(
+            near.sort_values("gap_to_low_%", ascending=True)[[f"price_{base_ccy}","gap_to_low_%","low_date","yahoo"]],
+            use_container_width=True
+        )
+
 
         st.markdown("#### D/E < 100 % & DivR > 5 % (Quick-View)")
         quick = base.copy()

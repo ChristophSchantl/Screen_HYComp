@@ -405,9 +405,11 @@ run_btn = st.sidebar.button("🔎 Score berechnen", use_container_width=True)
 # =========================
 st.subheader("Watchlist")
 if watchlist:
-    st.code(", ".join(watchlist), wrap=True)
+    with st.expander(f"Watchlist anzeigen ({len(watchlist)} Ticker)"):
+        st.code(", ".join(map(str, watchlist)), wrap_lines=True)
 else:
     st.info("Lade eine CSV hoch, füge Ticker manuell hinzu oder wähle einen Index.")
+
 
 if run_btn and watchlist:
     df = run_scoring(

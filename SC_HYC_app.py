@@ -1,7 +1,7 @@
 # app.py
-# High-Yield-Dividend Scoring – Streamlit App
-# -------------------------------------------
-# pip install streamlit yfinance pandas numpy lxml
+# High-Yield Dividend Scoring – Streamlit
+# ---------------------------------------
+# Neu: S&P 500, MDAX, FTSE 100, ATX Index-Lader
 
 import time
 from typing import Dict, List, Iterable
@@ -12,21 +12,19 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-# =========================
-# Streamlit Setup
-# =========================
 st.set_page_config(page_title="High-Yield Dividend Scoring", layout="wide")
 st.title("📈 High-Yield Dividend Scoring")
 st.caption("Yahoo Finance • TTM-basierte Kennzahlen • sektorrelative Perzentile • robuste Fetch-Logik")
 
-# =========================
-# Core Helpers (aus deinem Code, leicht angepasst)
-# =========================
+# -------------------------
+# Kern-Helper
+# -------------------------
 def _row(df: pd.DataFrame, keys: List[str]) -> pd.Series:
     for k in keys:
         if isinstance(df, pd.DataFrame) and k in df.index:
             s = df.loc[k].dropna().astype(float)
-            if len(s): return s
+            if len(s):
+                return s
     return pd.Series(dtype=float)
 
 def _ttm_sum(q_df: pd.DataFrame, keys: List[str], n: int = 4) -> float:
@@ -95,86 +93,139 @@ def _sp_fast_info(t: yf.Ticker):
     fast = getattr(t, "fast_info", {}) or {}
     mcap = fast.get("market_cap")
     adv3 = fast.get("three_month_average_volume") or fast.get("three_month_average_volume_shares")
-    return mcap, adv3
+    currency = (fast.get("currency") or "").upper()
+    last_price = fast.get("last_price")
+    return mcap, adv3, currency, last_price
 
 EXPECTED_COLS = [
-    "ticker","sector","price",
-    "div_yield_ttm","yield_5y_median","low_52w","high_52w","pos_52w",
-    "pe_ttm","ev_ebitda_ttm","de_ratio",
-    "fcf_ttm","fcf_margin_ttm","ebitda_ttm","ebitda_margin_ttm",
-    "beta_2y_w","market_cap","adv_3m",
-    "div_cash_ttm","coverage_fcf_ttm","fcf_payout_ttm","div_cut_24m","error"
+    "ticker","sector","price","div_yield_ttm","yield_5y_median","low_52w","high_52w","pos_52w",
+    "pe_ttm","ev_ebitda_ttm","de_ratio","fcf_ttm","fcf_margin_ttm","ebitda_ttm","ebitda_margin_ttm",
+    "beta_2y_w","market_cap","adv_3m","div_cash_ttm","coverage_fcf_ttm","fcf_payout_ttm","div_cut_24m","error"
 ]
 def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     for c in EXPECTED_COLS:
-        if c not in df.columns: df[c] = np.nan
+        if c not in df.columns:
+            df[c] = np.nan
     return df
 
-# =========================
-# Index-Constituents (DAX, Dow 30)
-# =========================
-@st.cache_data(ttl=60*60*12)  # 12h
+# -------------------------
+# Index-Loader (Wikipedia)
+# -------------------------
+def _clean_symbols(series: pd.Series) -> pd.Series:
+    # nur A-Z, 0-9, Punkt und Bindestrich behalten
+    return series.astype(str).str.upper().str.strip().str.replace(r"[^A-Z0-9\.\-]", "", regex=True)
+
+def _apply_suffix(symbols: List[str], suffix: str) -> List[str]:
+    out = []
+    for s in symbols:
+        if not s:
+            continue
+        out.append(s if "." in s else s + suffix)
+    return out
+
+@st.cache_data(ttl=60*60*12)
 def load_index_members(name: str) -> List[str]:
     name = name.lower().strip()
+
     if name in {"dax", "dax40"}:
-        # Wikipedia: DAX – Spalte "Ticker symbol" (ohne .DE)
         url = "https://en.wikipedia.org/wiki/DAX"
         tables = pd.read_html(url, flavor="lxml")
-        # suche Tabelle mit 'Ticker' oder 'Ticker symbol'
-        table = None
-        for tb in tables:
-            cols = [c.lower() for c in tb.columns.astype(str)]
-            if any("ticker" in c for c in cols):
-                table = tb
-                break
-        if table is None:
-            raise RuntimeError("DAX constituents not found on page")
-        # Spalte ermitteln
-        col = [c for c in table.columns if "Ticker" in str(c) or "ticker" in str(c).lower()][0]
-        syms = table[col].astype(str).str.replace(r"\W+", "", regex=True).str.upper().tolist()
-        return [s + ".DE" if "." not in s else s for s in syms]
+        tbl = next((tb for tb in tables if any("ticker" in str(c).lower() or "symbol" in str(c).lower()
+                                               for c in tb.columns)), None)
+        if tbl is None: raise RuntimeError("DAX constituents not found")
+        col = next(c for c in tbl.columns if "ticker" in str(c).lower() or "symbol" in str(c).lower())
+        syms = _clean_symbols(tbl[col])
+        return _apply_suffix(syms.tolist(), ".DE")
+
+    if name in {"mdax"}:
+        url = "https://en.wikipedia.org/wiki/MDAX"
+        tables = pd.read_html(url, flavor="lxml")
+        tbl = next((tb for tb in tables if any("ticker" in str(c).lower() or "symbol" in str(c).lower()
+                                               for c in tb.columns)), None)
+        if tbl is None: raise RuntimeError("MDAX constituents not found")
+        col = next(c for c in tbl.columns if "ticker" in str(c).lower() or "symbol" in str(c).lower())
+        syms = _clean_symbols(tbl[col])
+        return _apply_suffix(syms.tolist(), ".DE")
+
+    if name in {"ftse100", "ftse 100", "ftse 100 index"}:
+        url = "https://en.wikipedia.org/wiki/FTSE_100_Index"
+        tables = pd.read_html(url, flavor="lxml")
+        tbl = next((tb for tb in tables if any(("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower())
+                                               for c in tb.columns)), None)
+        if tbl is None: raise RuntimeError("FTSE 100 constituents not found")
+        col = next(c for c in tbl.columns if ("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower()))
+        syms = _clean_symbols(tbl[col])
+        return _apply_suffix(syms.tolist(), ".L")
+
+    if name in {"atx", "austrian traded index"}:
+        url = "https://en.wikipedia.org/wiki/ATX_(Austrian_Traded_Index)"
+        tables = pd.read_html(url, flavor="lxml")
+        tbl = next((tb for tb in tables if any(("ticker" in str(c).lower()) or ("symbol" in str(c).lower())
+                                               for c in tb.columns)), None)
+        if tbl is None: raise RuntimeError("ATX constituents not found")
+        col = next(c for c in tbl.columns if ("ticker" in str(c).lower()) or ("symbol" in str(c).lower()))
+        syms = _clean_symbols(tbl[col])
+        return _apply_suffix(syms.tolist(), ".VI")
+
     if name in {"dow", "djia", "dow jones 30", "dow jones"}:
         url = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average"
         tables = pd.read_html(url, flavor="lxml")
-        table = None
-        for tb in tables:
-            cols = [c.lower() for c in tb.columns.astype(str)]
-            if any(("symbol" in c) for c in cols):
-                table = tb
-                break
-        if table is None:
-            raise RuntimeError("Dow 30 constituents not found on page")
-        col = [c for c in table.columns if "Symbol" in str(c) or "symbol" in str(c).lower()][0]
-        syms = table[col].astype(str).str.replace(r"\W+", "", regex=True).str.upper().tolist()
-        return syms
-    raise ValueError("Unbekannter Index: " + name)
+        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
+        if tbl is None: raise RuntimeError("Dow 30 constituents not found")
+        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
+        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)
+        return syms.tolist()
 
-# =========================
-# Metrics + Scoring
-# =========================
-@st.cache_data(ttl=60*30)  # 30 min Cache je Ticker
+    if name in {"sp500", "s&p500", "s&p 500", "s&p", "s and p 500"}:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(url, flavor="lxml")
+        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
+        if tbl is None: raise RuntimeError("S&P 500 constituents not found")
+        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
+        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)  # BRK.B -> BRK-B
+        return syms.tolist()
+
+    raise ValueError(f"Unbekannter Index: {name}")
+
+# -------------------------
+# Metrics
+# -------------------------
+@st.cache_data(ttl=60*30)
 def metrics_for(ticker: str) -> Dict:
     t = yf.Ticker(ticker)
     try:
         px = _download_close_series(ticker, period="5y", interval="1d")
-        price = float(px.iloc[-1])
+
+        try:
+            info = t.get_info()
+        except Exception:
+            info = getattr(t, "info", {}) or {}
+        mcap_fast, adv_fast, currency_fast, last_price_fast = _sp_fast_info(t)
+        currency = (currency_fast or info.get("currency") or "").upper()
+
+        # GBX/GBp -> GBP (Pence -> Pfund)
+        if currency in {"GBX", "GBP(P)", "GBP (PENCE)", "GBp"}:
+            px = px * 0.01
+        price = float(last_price_fast) if last_price_fast is not None else float(px.iloc[-1])
+        if currency in {"GBX", "GBP(P)", "GBP (PENCE)", "GBp"}:
+            price = price * 0.01
 
         cutoff = px.index.max() - pd.Timedelta(days=365)
         px1y = px.loc[px.index >= cutoff]
         if px1y.empty and len(px) >= 252:
             px1y = px.tail(252)
-
-        low_52w = float(px1y.min())
-        high_52w = float(px1y.max())
-        rng = max(1e-9, high_52w - low_52w)
-        pos_52w = (price - low_52w) / rng
+        low_52w = float(px1y.min()) if len(px1y) else np.nan
+        high_52w = float(px1y.max()) if len(px1y) else np.nan
+        rng = (high_52w - low_52w) if np.isfinite(low_52w) and np.isfinite(high_52w) else np.nan
+        rng = max(1e-9, rng) if np.isfinite(rng) else np.nan
+        pos_52w = (price - low_52w) / rng if np.isfinite(rng) else np.nan
 
         div = t.dividends if hasattr(t, "dividends") else pd.Series(dtype=float)
         if isinstance(div, pd.Series) and len(div):
             div_ttm = float(div[div.index >= (div.index.max() - pd.Timedelta(days=365))].sum())
         else:
             div_ttm = 0.0
-        div_yield_ttm = div_ttm / price if price > 0 else np.nan
+        div_yield_ttm = (div_ttm / price) if price > 0 else np.nan
 
         pm = px.resample("ME").last()
         dm = div.resample("ME").sum().reindex(pm.index, fill_value=0.0) if len(div) else pd.Series(0.0, index=pm.index)
@@ -206,13 +257,8 @@ def metrics_for(ticker: str) -> Dict:
 
         equity = _ttm_sum(q_bs, ["Total Stockholder Equity","Total Equity Gross Minority Interest"])
         total_debt_cf = _ttm_sum(q_bs, ["Long Term Debt"]) + _ttm_sum(q_bs, ["Short Long Term Debt","Short Term Debt"])
-        if not np.isfinite(total_debt_cf): total_debt_cf = np.nan
-
-        try:
-            info = t.get_info()
-        except Exception:
-            info = getattr(t, "info", {}) or {}
-        mcap_fast, adv_fast = _sp_fast_info(t)
+        if not np.isfinite(total_debt_cf):
+            total_debt_cf = np.nan
 
         sector = (info.get("sector") or "Unknown")
         mcap = info.get("marketCap", mcap_fast)
@@ -238,20 +284,31 @@ def metrics_for(ticker: str) -> Dict:
         coverage_fcf = (fcf / div_cash_ttm) if (np.isfinite(fcf) and div_cash_ttm > 0) else np.inf
         fcf_payout   = (div_cash_ttm / fcf) if (np.isfinite(fcf) and fcf > 0) else np.inf
 
+        err = np.nan
+        if np.isfinite(div_yield_ttm) and div_yield_ttm > 0.25:
+            err = "yield_outlier_check_currency"
+
         return {
-            "ticker": ticker, "sector": sector, "price": price,
-            "div_yield_ttm": div_yield_ttm, "yield_5y_median": yld_5y_med,
-            "low_52w": low_52w, "high_52w": high_52w, "pos_52w": pos_52w,
-            "pe_ttm": pe_ttm, "ev_ebitda_ttm": ev_ebitda, "de_ratio": de_ratio,
-            "fcf_ttm": fcf, "fcf_margin_ttm": fcf_margin,
-            "ebitda_ttm": ebitda, "ebitda_margin_ttm": ebitda_margin,
-            "beta_2y_w": beta, "market_cap": mcap, "adv_3m": adv3,
-            "div_cash_ttm": div_cash_ttm, "coverage_fcf_ttm": coverage_fcf, "fcf_payout_ttm": fcf_payout,
-            "div_cut_24m": div_cut_24m, "error": np.nan
+            "ticker": ticker, "sector": sector, "price": float(price),
+            "div_yield_ttm": float(div_yield_ttm), "yield_5y_median": float(yld_5y_med) if np.isfinite(yld_5y_med) else np.nan,
+            "low_52w": low_52w, "high_52w": high_52w, "pos_52w": float(pos_52w) if np.isfinite(pos_52w) else np.nan,
+            "pe_ttm": float(pe_ttm) if np.isfinite(pe_ttm) else np.nan, "ev_ebitda_ttm": float(ev_ebitda) if np.isfinite(ev_ebitda) else np.nan,
+            "de_ratio": float(de_ratio) if np.isfinite(de_ratio) else np.nan,
+            "fcf_ttm": float(fcf) if np.isfinite(fcf) else np.nan, "fcf_margin_ttm": float(fcf_margin) if np.isfinite(fcf_margin) else np.nan,
+            "ebitda_ttm": float(ebitda) if np.isfinite(ebitda) else np.nan, "ebitda_margin_ttm": float(ebitda_margin) if np.isfinite(ebitda_margin) else np.nan,
+            "beta_2y_w": float(beta) if np.isfinite(beta) else np.nan, "market_cap": float(mcap) if np.isfinite(mcap) else np.nan,
+            "adv_3m": float(adv3) if np.isfinite(adv3) else np.nan,
+            "div_cash_ttm": float(div_cash_ttm) if np.isfinite(div_cash_ttm) else np.nan,
+            "coverage_fcf_ttm": float(coverage_fcf) if np.isfinite(coverage_fcf) else np.nan,
+            "fcf_payout_ttm": float(fcf_payout) if np.isfinite(fcf_payout) else np.nan,
+            "div_cut_24m": int(div_cut_24m), "error": err
         }
     except Exception as e:
         return {"ticker": ticker, "error": str(e)}
 
+# -------------------------
+# Scoring
+# -------------------------
 WEIGHTS: Dict[str, float] = {
     'sc_yield': 0.22, 'sc_52w': 0.18, 'sc_pe': 0.12, 'sc_ev_ebitda': 0.12,
     'sc_de': 0.12, 'sc_fcfm': 0.08, 'sc_ebitdam': 0.06, 'sc_beta': 0.06, 'sc_ygap': 0.04,
@@ -282,8 +339,7 @@ def build_scores(df: pd.DataFrame) -> pd.DataFrame:
     cap = np.where((d['fcf_payout_ttm'] > 1.0) | (d['coverage_fcf_ttm'] < 1.0), np.minimum(cap, 49), cap)
     cap = np.where((d['de_ratio'] > 2.5), cap - 15, cap)
     cap = np.where((d['beta_2y_w'] > 1.5), cap - 10, cap)
-    cap = np.where((d['pos_52w'] < 0.10) & ((d['fcf_margin_ttm'] <= 0) | (d['ebitda_margin_ttm'] <= 0)),
-                   np.minimum(cap, 49), cap)
+    cap = np.where((d['pos_52w'] < 0.10) & ((d['fcf_margin_ttm'] <= 0) | (d['ebitda_margin_ttm'] <= 0)), np.minimum(cap, 49), cap)
 
     d['score'] = pd.Series(cap, index=d.index).clip(0, 100)
     d['rating'] = np.select([d['score'] >= 75, (d['score'] >= 60) & (d['score'] < 75)],
@@ -303,12 +359,10 @@ def run_scoring(
     if not tickers:
         return pd.DataFrame(columns=EXPECTED_COLS)
 
-    # Parallel fetchen mit Progress
     rows, errors = [], []
-    pbar = st.progress(0.0, text="Lade Kennzahlen …")
+    pbar = st.progress(0.0, text="Kennzahlen: 0/0")
     total = len(tickers)
     done = 0
-
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(metrics_for, tk): tk for tk in tickers}
         for fut in as_completed(futs):
@@ -323,7 +377,6 @@ def run_scoring(
 
     df = _ensure_columns(pd.DataFrame(rows))
 
-    # Pre-Filter
     df['pf_yield']  = df['div_yield_ttm'] >= min_yield
     df['pf_mcap']   = np.isfinite(df['market_cap']) & (df['market_cap'] >= min_mcap)
     df['pf_adv']    = np.isfinite(df['adv_3m']) & (df['adv_3m'] >= min_adv)
@@ -337,7 +390,7 @@ def run_scoring(
         out['rating'] = 'PF-FAIL (check filters)'
         out['div_yield_%'] = out['div_yield_ttm'] * 100
         out['pos_52w_%'] = out['pos_52w'] * 100
-        # Darstellung runden
+        out['near_52w_low_%'] = (1 - out['pos_52w']).clip(0, 1) * 100
         num_cols = out.select_dtypes(include=[np.number]).columns
         out[num_cols] = out[num_cols].round(2)
         return out
@@ -346,63 +399,63 @@ def run_scoring(
     out = scored.copy()
     out['div_yield_%'] = out['div_yield_ttm'] * 100
     out['pos_52w_%'] = out['pos_52w'] * 100
+    out['near_52w_low_%'] = (1 - out['pos_52w']).clip(0, 1) * 100
 
-    # Sortieren + Runden (nur Darstellung)
     out = out.sort_values('score', ascending=False).reset_index(drop=True)
     num_cols = out.select_dtypes(include=[np.number]).columns
     out[num_cols] = out[num_cols].round(2)
     return out
 
-# =========================
-# Sidebar – Data Input
-# =========================
+# -------------------------
+# Sidebar – Inputs
+# -------------------------
 st.sidebar.header("📥 Eingabedaten")
 
-# 1) CSV Upload
 csv_file = st.sidebar.file_uploader("CSV mit Tickern hochladen", type=["csv"])
 uploaded_syms = []
 if csv_file is not None:
-    df_csv = pd.read_csv(csv_file)
-    # Spalten anbieten
+    try:
+        df_csv = pd.read_csv(csv_file)
+    except Exception:
+        csv_file.seek(0); df_csv = pd.read_csv(csv_file, sep=";")
     col = st.sidebar.selectbox("Spalte mit Tickern auswählen", df_csv.columns.tolist())
-    uploaded_syms = (
-        df_csv[col].astype(str).str.strip().replace({"nan": np.nan}).dropna().tolist()
-    )
-    st.sidebar.success(f"{len(uploaded_syms)} Ticker aus CSV geladen")
+    uploaded_syms = df_csv[col].astype(str).str.strip().replace({"nan": np.nan}).dropna().tolist()
+    st.sidebar.success(f"{len(uploaded_syms)} Ticker aus CSV")
 
-# 2) Manuell
 manual = st.sidebar.text_area("Ticker manuell (kommasepariert)", placeholder="z.B. T, VZ, MO, RIO, BTI")
 manual_syms = [s.strip().upper() for s in manual.split(",") if s.strip()] if manual else []
 
-# 3) Index Loader
 st.sidebar.subheader("📚 Index hinzufügen")
-index_choice = st.sidebar.selectbox("Index", ["– auswählen –", "DAX", "Dow Jones 30"])
+index_choice = st.sidebar.selectbox(
+    "Index",
+    ["– auswählen –", "DAX", "MDAX", "FTSE 100", "ATX", "Dow Jones 30", "S&P 500"]
+)
 index_syms = []
 if index_choice != "– auswählen –":
     try:
-        index_syms = load_index_members(index_choice)
+        q = index_choice.lower()
+        mapping = {"ftse 100":"ftse100","dow jones 30":"dow jones 30","s&p 500":"s&p 500"}
+        idx_key = mapping.get(index_choice.lower(), q)
+        index_syms = load_index_members(idx_key)
         st.sidebar.info(f"{index_choice}: {len(index_syms)} Werte geladen")
     except Exception as e:
         st.sidebar.error(f"Index-Fehler: {e}")
 
-# 4) Watchlist zusammenführen
 watchlist = sorted({*uploaded_syms, *manual_syms, *index_syms})
 st.sidebar.caption(f"Gesamt-Watchlist: **{len(watchlist)}** Ticker")
 
-# 5) Filter & Optionen
 st.sidebar.header("⚙️ Filter & Optionen")
-min_yield = st.sidebar.number_input("Min. Dividendenrendite", min_value=0.0, max_value=0.2, value=0.05, step=0.005, format="%.3f")
+min_yield = st.sidebar.number_input("Min. Dividendenrendite", min_value=0.0, max_value=0.3, value=0.05, step=0.005, format="%.3f")
 min_mcap  = st.sidebar.number_input("Min. Market Cap (USD)", min_value=0.0, value=1_000_000_000.0, step=100_000_000.0, format="%.0f")
 min_adv   = st.sidebar.number_input("Min. 3M ADV (Shares)", min_value=0.0, value=1_500_000.0, step=100_000.0, format="%.0f")
 exclude_financials = st.sidebar.checkbox("Finanzsektor ausschließen", value=True)
 drop_pf = st.sidebar.checkbox("Nur Pre-Filter-Pass zeigen", value=True)
 max_workers = st.sidebar.slider("Parallel-Worker", 1, 12, 6)
-
 run_btn = st.sidebar.button("🔎 Score berechnen", use_container_width=True)
 
-# =========================
-# Main – Execution & Output
-# =========================
+# -------------------------
+# Main
+# -------------------------
 st.subheader("Watchlist")
 if watchlist:
     with st.expander(f"Watchlist anzeigen ({len(watchlist)} Ticker)"):
@@ -410,32 +463,23 @@ if watchlist:
 else:
     st.info("Lade eine CSV hoch, füge Ticker manuell hinzu oder wähle einen Index.")
 
-
 if run_btn and watchlist:
     df = run_scoring(
-        watchlist,
-        min_yield=min_yield,
-        min_mcap=min_mcap,
-        min_adv=min_adv,
-        exclude_financials=exclude_financials,
-        drop_prefilter_fails=drop_pf,
-        max_workers=max_workers,
+        watchlist, min_yield=min_yield, min_mcap=min_mcap, min_adv=min_adv,
+        exclude_financials=exclude_financials, drop_prefilter_fails=drop_pf, max_workers=max_workers
     )
 
-    # Kennzahlen/Übersicht
     st.subheader("Ergebnisse")
     if not df.empty:
-        # Rating-Zusammenfassung
         counts = df['rating'].value_counts(dropna=False)
-        cols = st.columns(4)
-        cols[0].metric("BUY", int(counts.get("BUY", 0)))
-        cols[1].metric("ACCUMULATE/WATCH", int(counts.get("ACCUMULATE/WATCH", 0)))
-        cols[2].metric("AVOID/HOLD", int(counts.get("AVOID/HOLD", 0)))
-        cols[3].metric("Total", len(df))
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("BUY", int(counts.get("BUY", 0)))
+        c2.metric("ACCUMULATE/WATCH", int(counts.get("ACCUMULATE/WATCH", 0)))
+        c3.metric("AVOID/HOLD", int(counts.get("AVOID/HOLD", 0)))
+        c4.metric("Total", len(df))
 
-        # Anzeige-Tabelle
         prefer_cols = [
-            'ticker','sector','price','div_yield_%','pos_52w_%',
+            'ticker','sector','price','div_yield_%','near_52w_low_%',
             'pe_ttm','ev_ebitda_ttm','de_ratio','fcf_margin_ttm','ebitda_margin_ttm',
             'beta_2y_w','market_cap','adv_3m','score','rating','error'
         ]
@@ -445,7 +489,7 @@ if run_btn and watchlist:
             use_container_width=True,
             column_config={
                 "div_yield_%": st.column_config.NumberColumn("DivR %", format="%.2f"),
-                "pos_52w_%": st.column_config.NumberColumn("Nähe 52W-Low %", format="%.2f"),
+                "near_52w_low_%": st.column_config.NumberColumn("Nähe 52W-Low %", format="%.2f"),
                 "price": st.column_config.NumberColumn("Price", format="%.2f"),
                 "pe_ttm": st.column_config.NumberColumn("PE (TTM)", format="%.2f"),
                 "ev_ebitda_ttm": st.column_config.NumberColumn("EV/EBITDA", format="%.2f"),
@@ -459,15 +503,17 @@ if run_btn and watchlist:
             },
         )
 
-        # Download
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Ergebnisse als CSV", data=csv, file_name="high_yield_scores.csv", mime="text/csv")
+        st.download_button(
+            "⬇️ Ergebnisse als CSV",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="high_yield_scores.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
-        # Fehlerliste (falls vorhanden)
         err_df = df[df['error'].notna()][['ticker','error']]
         if not err_df.empty:
-            st.warning("Einige Ticker hatten Fehler beim Laden:")
+            st.warning("Hinweise/Fehler beim Laden einiger Ticker:")
             st.dataframe(err_df, use_container_width=True)
-
 else:
-    st.caption("Tipp: Bei europäischen Werten ggf. Yahoo-Suffixe nutzen (z. B. **.DE**, **.L**, **.PA**).")
+    st.caption("Tipp: Bei EU/UK-Werten Yahoo-Suffixe nutzen (.DE, .L, .VI, .PA, …).")

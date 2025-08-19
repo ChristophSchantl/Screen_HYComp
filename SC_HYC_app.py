@@ -1,5 +1,5 @@
 # app.py
-# High-Yield Dividend Scoring – Streamlit (clean & robust)
+# High-Yield Dividend Scoring – Streamlit (clean, robust, GBX-safe)
 
 import time
 from typing import Dict, List, Iterable
@@ -40,8 +40,8 @@ def _percentile_rank(s: pd.Series) -> pd.Series:
 
 def _sector_percentile(df: pd.DataFrame, col: str, invert: bool = False) -> pd.Series:
     work = df.copy()
-    work['sector'] = work.get('sector', pd.Series(index=work.index, dtype='object')).fillna('Unknown')
-    p = work.groupby('sector', dropna=False, group_keys=False)[col].apply(_percentile_rank)
+    work["sector"] = work.get("sector", pd.Series(index=work.index, dtype="object")).fillna("Unknown")
+    p = work.groupby("sector", dropna=False, group_keys=False)[col].apply(_percentile_rank)
     if invert:
         p = 1 - p
     return (p * 100).clip(0, 100)
@@ -49,6 +49,20 @@ def _sector_percentile(df: pd.DataFrame, col: str, invert: bool = False) -> pd.S
 def _map_beta(b: float) -> float:
     # 0.4→100, 0.8→70, 1.0→50, 1.5→0
     return float(np.interp(b, [0.4, 0.8, 1.0, 1.5], [100, 70, 50, 0], left=100, right=0))
+
+def _is_num(x) -> bool:
+    try:
+        f = float(x)
+        return np.isfinite(f)
+    except Exception:
+        return False
+
+def _to_float(x) -> float:
+    try:
+        f = float(x)
+        return f if np.isfinite(f) else np.nan
+    except Exception:
+        return np.nan
 
 # =========================
 # Price/History (history() only)
@@ -193,17 +207,18 @@ def metrics_for(ticker: str) -> Dict:
             raise RuntimeError("No price history")
 
         # last price
-        price = fast.get("last_price")
-        if price is None or not np.isfinite(price):
-            price = float(px.iloc[-1])
+        price_fast = _to_float(fast.get("last_price"))
+        price = price_fast if np.isfinite(price_fast) and price_fast > 0 else float(px.iloc[-1])
 
         # 52w low/high from fast or last-1y history
         low_52w = fast.get("year_low"); high_52w = fast.get("year_high")
-        if not (np.isfinite(low_52w) and np.isfinite(high_52w)):
+        if not (_is_num(low_52w) and _is_num(high_52w)):
             px1y = _hist_close(t, period="1y", interval="1d")
             if px1y.empty:
                 px1y = px.tail(252)
             low_52w, high_52w = float(px1y.min()), float(px1y.max())
+        else:
+            low_52w, high_52w = float(low_52w), float(high_52w)
 
         # GBX→GBP scaling
         if is_gbx:
@@ -213,15 +228,17 @@ def metrics_for(ticker: str) -> Dict:
             px = px * 0.01
 
         # position in 52w band
-        rng = (high_52w - low_52w)
-        rng = max(1e-9, rng) if np.isfinite(rng) else np.nan
-        pos_52w = (float(price) - low_52w) / rng if np.isfinite(rng) else np.nan  # 0=Low, 1=High
+        rng = high_52w - low_52w
+        pos_52w = (price - low_52w) / (rng if _is_num(rng) and rng > 0 else np.nan)
 
         # --- Dividends & yields
         try:
             div = t.get_dividends()
         except Exception:
             div = getattr(t, "dividends", pd.Series(dtype=float))
+        if is_gbx and isinstance(div, pd.Series) and len(div):
+            div = div * 0.01
+
         if isinstance(div, pd.Series) and len(div):
             div_ttm = float(div[div.index >= (div.index.max() - pd.Timedelta(days=365))].sum())
         else:
@@ -229,8 +246,8 @@ def metrics_for(ticker: str) -> Dict:
         div_yield_ttm = (div_ttm / float(price)) if price and price > 0 else np.nan
 
         # 5y median yield (fallback to available months)
-        pm = px.resample("ME").last()
-        dm = div.resample("ME").sum().reindex(pm.index, fill_value=0.0) if len(div) else pd.Series(0.0, index=pm.index)
+        pm = px.resample("M").last()
+        dm = div.resample("M").sum().reindex(pm.index, fill_value=0.0) if isinstance(div, pd.Series) and len(div) else pd.Series(0.0, index=pm.index)
         ttm_div_m = dm.rolling(12, min_periods=1).sum()
         yld_m = (ttm_div_m / pm).dropna()
         if len(yld_m):
@@ -262,30 +279,34 @@ def metrics_for(ticker: str) -> Dict:
 
         equity = _ttm_sum(q_bs, ["Total Stockholder Equity","Total Equity Gross Minority Interest"])
         total_debt_cf = _ttm_sum(q_bs, ["Long Term Debt"]) + _ttm_sum(q_bs, ["Short Long Term Debt","Short Term Debt"])
-        if not np.isfinite(total_debt_cf):
-            total_debt_cf = np.nan
+        total_debt_cf = total_debt_cf if np.isfinite(total_debt_cf) else np.nan
 
         sector = (info.get("sector") or "Unknown")
-        mcap = info.get("marketCap", fast.get("market_cap"))
-        adv3 = info.get("averageDailyVolume3Month", fast.get("three_month_average_volume"))
+        mcap = _to_float(info.get("marketCap", fast.get("market_cap")))
+        adv3 = _to_float(info.get("averageDailyVolume3Month", fast.get("three_month_average_volume")))
 
-        total_debt = info.get("totalDebt", total_debt_cf)
-        cash = info.get("totalCash", np.nan)
+        total_debt = _to_float(info.get("totalDebt", total_debt_cf))
+        cash = _to_float(info.get("totalCash", np.nan))
 
         de_ratio = (total_debt / equity) if (np.isfinite(total_debt) and np.isfinite(equity) and equity > 0) else np.nan
-        pe_ttm = info.get("trailingPE", np.nan)
+        pe_ttm = _to_float(info.get("trailingPE", np.nan))
 
-        ev = (mcap if np.isfinite(mcap) else np.nan) + (total_debt if np.isfinite(total_debt) else 0) - (cash if np.isfinite(cash) else 0)
-        ev_ebitda = (ev / ebitda) if (np.isfinite(ev) and np.isfinite(ebitda) and ebitda > 0) else np.nan
+        ev_num = (mcap if np.isfinite(mcap) else np.nan)
+        if np.isfinite(ev_num):
+            ev_num += (total_debt if np.isfinite(total_debt) else 0) - (cash if np.isfinite(cash) else 0)
+        ev_ebitda = (ev_num / ebitda) if (np.isfinite(ev_num) and np.isfinite(ebitda) and ebitda > 0) else np.nan
 
         fcf_margin = (fcf / revenue) if (np.isfinite(fcf) and np.isfinite(revenue) and revenue > 0) else np.nan
         ebitda_margin = (ebitda / revenue) if (np.isfinite(ebitda) and np.isfinite(revenue) and revenue > 0) else np.nan
 
         # --- Beta (2y weekly) vs S&P 500 using history()
-        spx = yf.Ticker("^GSPC").history(period="2y", interval="1wk", auto_adjust=True)["Close"].pct_change().dropna()
-        stw = t.history(period="2y", interval="1wk", auto_adjust=True)["Close"].pct_change().dropna()
-        bdf = pd.concat([stw, spx], axis=1).dropna()
-        beta = float(np.polyfit(bdf.iloc[:,1].values, bdf.iloc[:,0].values, 1)[0]) if len(bdf) > 10 else np.nan
+        try:
+            spx = yf.Ticker("^GSPC").history(period="2y", interval="1wk", auto_adjust=True)["Close"].pct_change().dropna()
+            stw = t.history(period="2y", interval="1wk", auto_adjust=True)["Close"].pct_change().dropna()
+            bdf = pd.concat([stw, spx], axis=1).dropna()
+            beta = float(np.polyfit(bdf.iloc[:,1].values, bdf.iloc[:,0].values, 1)[0]) if len(bdf) > 10 else np.nan
+        except Exception:
+            beta = np.nan
 
         # Coverage / payout
         coverage_fcf = (fcf / div_cash_ttm) if (np.isfinite(fcf) and div_cash_ttm > 0) else np.inf
@@ -324,40 +345,43 @@ def metrics_for(ticker: str) -> Dict:
 # Scoring
 # =========================
 WEIGHTS: Dict[str, float] = {
-    'sc_yield': 0.22, 'sc_52w': 0.18, 'sc_pe': 0.12, 'sc_ev_ebitda': 0.12,
-    'sc_de': 0.12, 'sc_fcfm': 0.08, 'sc_ebitdam': 0.06, 'sc_beta': 0.06, 'sc_ygap': 0.04,
+    "sc_yield": 0.22, "sc_52w": 0.18, "sc_pe": 0.12, "sc_ev_ebitda": 0.12,
+    "sc_de": 0.12, "sc_fcfm": 0.08, "sc_ebitdam": 0.06, "sc_beta": 0.06, "sc_ygap": 0.04,
 }
 
 def build_scores(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-    d['sc_yield']    = (np.clip((d['div_yield_ttm'] - 0.05) / 0.05, 0, 1) * 100)
-    d['sc_52w']      = ((1 - d['pos_52w']).clip(0, 1) * 100)
-    d['sc_pe']       = _sector_percentile(d, 'pe_ttm', invert=True)
-    d['sc_ev_ebitda']= _sector_percentile(d, 'ev_ebitda_ttm', invert=True)
-    d['sc_de']       = _sector_percentile(d, 'de_ratio', invert=True)
-    d.loc[~np.isfinite(d['de_ratio']) | (d['de_ratio'] < 0), 'sc_de'] = 0
-    d['sc_fcfm']     = _sector_percentile(d, 'fcf_margin_ttm', invert=False)
-    d['sc_ebitdam']  = _sector_percentile(d, 'ebitda_margin_ttm', invert=False)
-    d['sc_beta']     = d['beta_2y_w'].apply(_map_beta)
-    ygap             = (d['div_yield_ttm'] / d['yield_5y_median']) - 1.0
-    d['sc_ygap']     = _sector_percentile(pd.DataFrame({'sector': d['sector'], 'ygap': ygap}), 'ygap', invert=False)
+    d["sc_yield"]     = (np.clip((d["div_yield_ttm"] - 0.05) / 0.05, 0, 1) * 100)
+    d["sc_52w"]       = ((1 - d["pos_52w"]).clip(0, 1) * 100)
+    d["sc_pe"]        = _sector_percentile(d, "pe_ttm", invert=True)
+    d["sc_ev_ebitda"] = _sector_percentile(d, "ev_ebitda_ttm", invert=True)
+    d["sc_de"]        = _sector_percentile(d, "de_ratio", invert=True)
+    d.loc[~np.isfinite(d["de_ratio"]) | (d["de_ratio"] < 0), "sc_de"] = 0
+    d["sc_fcfm"]      = _sector_percentile(d, "fcf_margin_ttm", invert=False)
+    d["sc_ebitdam"]   = _sector_percentile(d, "ebitda_margin_ttm", invert=False)
+    d["sc_beta"]      = d["beta_2y_w"].apply(lambda b: _map_beta(b) if np.isfinite(b) else 50.0)
+
+    ygap = np.where(d["yield_5y_median"] > 0,
+                    d["div_yield_ttm"] / d["yield_5y_median"] - 1.0,
+                    np.nan)
+    d["sc_ygap"] = _sector_percentile(pd.DataFrame({"sector": d["sector"], "ygap": ygap}), "ygap", invert=False)
 
     S = d[list(WEIGHTS.keys())].astype(float)
     w = pd.Series(WEIGHTS)
     num = (S * w).sum(axis=1, skipna=True)
     den = ((~S.isna()) * w).sum(axis=1)
-    d['score_raw'] = np.where(den > 0, num / den, np.nan)
+    d["score_raw"] = np.where(den > 0, num / den, np.nan)
 
-    cap = d['score_raw'].copy()
-    cap = np.where(d['div_cut_24m'] == 1, np.minimum(cap, 59), cap)
-    cap = np.where((d['fcf_payout_ttm'] > 1.0) | (d['coverage_fcf_ttm'] < 1.0), np.minimum(cap, 49), cap)
-    cap = np.where((d['de_ratio'] > 2.5), cap - 15, cap)
-    cap = np.where((d['beta_2y_w'] > 1.5), cap - 10, cap)
-    cap = np.where((d['pos_52w'] < 0.10) & ((d['fcf_margin_ttm'] <= 0) | (d['ebitda_margin_ttm'] <= 0)), np.minimum(cap, 49), cap)
+    cap = d["score_raw"].copy()
+    cap = np.where(d["div_cut_24m"] == 1, np.minimum(cap, 59), cap)
+    cap = np.where((d["fcf_payout_ttm"] > 1.0) | (d["coverage_fcf_ttm"] < 1.0), np.minimum(cap, 49), cap)
+    cap = np.where((d["de_ratio"] > 2.5), cap - 15, cap)
+    cap = np.where((d["beta_2y_w"] > 1.5), cap - 10, cap)
+    cap = np.where((d["pos_52w"] < 0.10) & ((d["fcf_margin_ttm"] <= 0) | (d["ebitda_margin_ttm"] <= 0)), np.minimum(cap, 49), cap)
 
-    d['score'] = pd.Series(cap, index=d.index).clip(0, 100)
-    d['rating'] = np.select([d['score'] >= 75, (d['score'] >= 60) & (d['score'] < 75)],
-                            ['BUY', 'ACCUMULATE/WATCH'], default='AVOID/HOLD')
+    d["score"] = pd.Series(cap, index=d.index).clip(0, 100)
+    d["rating"] = np.select([d["score"] >= 75, (d["score"] >= 60) & (d["score"] < 75)],
+                            ["BUY", "ACCUMULATE/WATCH"], default="AVOID/HOLD")
     return d
 
 # =========================
@@ -394,31 +418,32 @@ def run_scoring(
 
     df = _ensure_columns(pd.DataFrame(rows))
 
-    df['pf_yield']  = df['div_yield_ttm'] >= min_yield
-    df['pf_mcap']   = np.isfinite(df['market_cap']) & (df['market_cap'] >= min_mcap)
-    df['pf_adv']    = np.isfinite(df['adv_3m']) & (df['adv_3m'] >= min_adv)
-    df['pf_sector'] = ~(df['sector'].fillna('Unknown').str.contains('Financial', na=False)) if exclude_financials else True
-    df['prefilter_pass'] = df[['pf_yield','pf_mcap','pf_adv','pf_sector']].all(axis=1)
+    df["pf_yield"]  = df["div_yield_ttm"] >= min_yield
+    df["pf_mcap"]   = np.isfinite(df["market_cap"]) & (df["market_cap"] >= min_mcap)
+    df["pf_adv"]    = np.isfinite(df["adv_3m"]) & (df["adv_3m"] >= min_adv)
+    df["pf_sector"] = ~(df["sector"].fillna("Unknown").str.contains("Financial", na=False)) \
+                      if exclude_financials else pd.Series(True, index=df.index)
+    df["prefilter_pass"] = df[["pf_yield","pf_mcap","pf_adv","pf_sector"]].all(axis=1)
 
-    base = df[df['prefilter_pass']].copy() if drop_prefilter_fails else df.copy()
+    base = df[df["prefilter_pass"]].copy() if drop_prefilter_fails else df.copy()
     if base.empty:
         out = df.copy()
-        out['score'] = np.nan
-        out['rating'] = 'PF-FAIL (check filters)'
-        out['div_yield_%'] = out['div_yield_ttm'] * 100
-        out['pos_52w_%'] = out['pos_52w'] * 100
-        out['near_52w_low_%'] = (1 - out['pos_52w']).clip(0, 1) * 100
+        out["score"] = np.nan
+        out["rating"] = "PF-FAIL (check filters)"
+        out["div_yield_%"] = out["div_yield_ttm"] * 100
+        out["pos_52w_%"] = out["pos_52w"] * 100
+        out["near_52w_low_%"] = (1 - out["pos_52w"]).clip(0, 1) * 100
         num_cols = out.select_dtypes(include=[np.number]).columns
         out[num_cols] = out[num_cols].round(2)
         return out
 
     scored = build_scores(base)
     out = scored.copy()
-    out['div_yield_%'] = out['div_yield_ttm'] * 100
-    out['pos_52w_%'] = out['pos_52w'] * 100
-    out['near_52w_low_%'] = (1 - out['pos_52w']).clip(0, 1) * 100
+    out["div_yield_%"] = out["div_yield_ttm"] * 100
+    out["pos_52w_%"] = out["pos_52w"] * 100
+    out["near_52w_low_%"] = (1 - out["pos_52w"]).clip(0, 1) * 100
 
-    out = out.sort_values('score', ascending=False).reset_index(drop=True)
+    out = out.sort_values("score", ascending=False).reset_index(drop=True)
     num_cols = out.select_dtypes(include=[np.number]).columns
     out[num_cols] = out[num_cols].round(2)
     return out
@@ -487,7 +512,7 @@ if run_btn and watchlist:
 
     st.subheader("Ergebnisse")
     if not df.empty:
-        counts = df['rating'].value_counts(dropna=False)
+        counts = df["rating"].value_counts(dropna=False)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("BUY", int(counts.get("BUY", 0)))
         c2.metric("ACCUMULATE/WATCH", int(counts.get("ACCUMULATE/WATCH", 0)))
@@ -495,9 +520,9 @@ if run_btn and watchlist:
         c4.metric("Total", len(df))
 
         prefer_cols = [
-            'ticker','sector','price','div_yield_%','near_52w_low_%',
-            'pe_ttm','ev_ebitda_ttm','de_ratio','fcf_margin_ttm','ebitda_margin_ttm',
-            'beta_2y_w','market_cap','adv_3m','score','rating','error'
+            "ticker","sector","price","div_yield_%","near_52w_low_%",
+            "pe_ttm","ev_ebitda_ttm","de_ratio","fcf_margin_ttm","ebitda_margin_ttm",
+            "beta_2y_w","market_cap","adv_3m","score","rating","error"
         ]
         show_cols = [c for c in prefer_cols if c in df.columns]
         st.dataframe(
@@ -527,7 +552,7 @@ if run_btn and watchlist:
             use_container_width=True,
         )
 
-        err_df = df[df['error'].notna()][['ticker','error']]
+        err_df = df[df["error"].notna()][["ticker","error"]]
         if not err_df.empty:
             st.warning("Hinweise/Fehler beim Laden einiger Ticker:")
             st.dataframe(err_df, use_container_width=True)

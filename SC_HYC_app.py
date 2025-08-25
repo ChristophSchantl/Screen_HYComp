@@ -1,22 +1,25 @@
 # app.py
-# High-Yield Dividend Scoring – Streamlit (clean, robust, GBX-safe)
+# High-Yield Dividend Scoring – Streamlit (editierbare Gewichte, bessere Index-Auswahl)
 
+from __future__ import annotations
 import time
 from typing import Dict, List, Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
+# ─────────────────────────────────────────────────────────────
+# Seite
+# ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="High-Yield Dividend Scoring", layout="wide")
 st.title("📈 High-Yield Dividend Scoring")
 st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • robuste Datenlogik")
 
-# =========================
-# Generic helpers
-# =========================
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
 def _row(df: pd.DataFrame, keys: List[str]) -> pd.Series:
     for k in keys:
         if isinstance(df, pd.DataFrame) and k in df.index:
@@ -64,18 +67,16 @@ def _to_float(x) -> float:
     except Exception:
         return np.nan
 
-# =========================
-# Price/History (history() only)
-# =========================
-def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
-    """Always return a Close price Series via Ticker.history()."""
-    try:
-        h = t.history(period=period, interval=interval, auto_adjust=True)
-        if isinstance(h, pd.DataFrame) and "Close" in h.columns:
-            return h["Close"].dropna()
-    except Exception:
-        pass
-    return pd.Series(dtype=float)
+def _clean_symbols(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.upper().str.strip().str.replace(r"[^A-Z0-9\.\-]", "", regex=True)
+
+def _apply_suffix(symbols: List[str], suffix: str) -> List[str]:
+    out = []
+    for s in symbols:
+        if not s:
+            continue
+        out.append(s if "." in s else s + suffix)
+    return out
 
 def _safe_info(t: yf.Ticker) -> Dict:
     try:
@@ -86,9 +87,9 @@ def _safe_info(t: yf.Ticker) -> Dict:
 def _safe_fast(t: yf.Ticker) -> Dict:
     return getattr(t, "fast_info", {}) or {}
 
-# =========================
-# Expected columns
-# =========================
+# ─────────────────────────────────────────────────────────────
+# Erwartete Spalten
+# ─────────────────────────────────────────────────────────────
 EXPECTED_COLS = [
     "ticker","sector","price","div_yield_ttm","yield_5y_median",
     "low_52w","high_52w","pos_52w",
@@ -104,20 +105,22 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = np.nan
     return df
 
-# =========================
-# Index constituents (Wikipedia)
-# =========================
-def _clean_symbols(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.upper().str.strip().str.replace(r"[^A-Z0-9\.\-]", "", regex=True)
+# ─────────────────────────────────────────────────────────────
+# Kurs-Historie
+# ─────────────────────────────────────────────────────────────
+def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
+    """Immer Close per history() liefern."""
+    try:
+        h = t.history(period=period, interval=interval, auto_adjust=True)
+        if isinstance(h, pd.DataFrame) and "Close" in h.columns:
+            return h["Close"].dropna()
+    except Exception:
+        pass
+    return pd.Series(dtype=float)
 
-def _apply_suffix(symbols: List[str], suffix: str) -> List[str]:
-    out = []
-    for s in symbols:
-        if not s:
-            continue
-        out.append(s if "." in s else s + suffix)
-    return out
-
+# ─────────────────────────────────────────────────────────────
+# Index-Mitglieder (Wikipedia)
+# ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60*60*12)
 def load_index_members(name: str) -> List[str]:
     name = name.lower().strip()
@@ -152,15 +155,15 @@ def load_index_members(name: str) -> List[str]:
         syms = _clean_symbols(tbl[col])
         return _apply_suffix(syms.tolist(), ".L")
 
-    if name in {"atx", "austrian traded index"}:
-        url = "https://en.wikipedia.org/wiki/ATX_(Austrian_Traded_Index)"
+    if name in {"ftse250", "ftse 250"}:
+        url = "https://en.wikipedia.org/wiki/FTSE_250_Index"
         tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any(("ticker" in str(c).lower()) or ("symbol" in str(c).lower())
+        tbl = next((tb for tb in tables if any(("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower())
                                                for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("ATX constituents not found")
-        col = next(c for c in tbl.columns if ("ticker" in str(c).lower()) or ("symbol" in str(c).lower()))
+        if tbl is None: raise RuntimeError("FTSE 250 constituents not found")
+        col = next(c for c in tbl.columns if ("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower()))
         syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".VI")
+        return _apply_suffix(syms.tolist(), ".L")
 
     if name in {"dow", "djia", "dow jones 30", "dow jones"}:
         url = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average"
@@ -180,25 +183,60 @@ def load_index_members(name: str) -> List[str]:
         syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)
         return syms.tolist()
 
+    if name in {"sp500_diva", "s&p 500 dividend aristocrats"}:
+        url = "https://en.wikipedia.org/wiki/S%26P_500_Dividend_Aristocrats"
+        tables = pd.read_html(url, flavor="lxml")
+        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
+        if tbl is None: raise RuntimeError("S&P 500 Dividend Aristocrats not found")
+        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
+        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)
+        return syms.tolist()
+
+    if name in {"sp400_diva", "s&p 400 dividend aristocrats"}:
+        url = "https://en.wikipedia.org/wiki/S%26P_400_Dividend_Aristocrats"
+        tables = pd.read_html(url, flavor="lxml")
+        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
+        if tbl is None: raise RuntimeError("S&P 400 Dividend Aristocrats not found")
+        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
+        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)
+        return syms.tolist()
+
+    if name in {"tsx60", "s&p/tsx 60"}:
+        url = "https://en.wikipedia.org/wiki/S%26P/TSX_60"
+        tables = pd.read_html(url, flavor="lxml")
+        tbl = next((tb for tb in tables if any(("symbol" in str(c).lower()) or ("ticker" in str(c).lower())
+                                               for c in tb.columns)), None)
+        if tbl is None: raise RuntimeError("S&P/TSX 60 constituents not found")
+        col = next(c for c in tbl.columns if ("symbol" in str(c).lower()) or ("ticker" in str(c).lower()))
+        syms = _clean_symbols(tbl[col])
+        return _apply_suffix(syms.tolist(), ".TO")
+
+    if name in {"asx200", "s&p/asx 200"}:
+        url = "https://en.wikipedia.org/wiki/S%26P/ASX_200"
+        tables = pd.read_html(url, flavor="lxml")
+        tbl = next((tb for tb in tables if any(("code" in str(c).lower()) or ("symbol" in str(c).lower())
+                                               for c in tb.columns)), None)
+        if tbl is None: raise RuntimeError("S&P/ASX 200 constituents not found")
+        col = next(c for c in tbl.columns if ("code" in str(c).lower()) or ("symbol" in str(c).lower()))
+        syms = _clean_symbols(tbl[col])
+        return _apply_suffix(syms.tolist(), ".AX")
+
     raise ValueError(f"Unbekannter Index: {name}")
 
-# =========================
-# Metrics (history-based, GBX fix, robust)
-# =========================
+# ─────────────────────────────────────────────────────────────
+# Metrics (TTM, robust, GBX-fix)
+# ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60*30)
 def metrics_for(ticker: str) -> Dict:
     t = yf.Ticker(ticker)
     try:
-        # --- Meta / currency
         info = _safe_info(t)
         fast = _safe_fast(t)
         currency = (fast.get("currency") or info.get("currency") or "").upper()
         is_gbx = currency in {"GBX", "GBp"} or (ticker.endswith(".L") and currency in {"", None})
 
-        # --- Prices from history()
         px = _hist_close(t, period="5y", interval="1d")
         if px.empty:
-            # last resort fallback via download()
             try:
                 px = yf.download(ticker, period="5y", interval="1d", auto_adjust=True, progress=False)["Close"].dropna()
             except Exception:
@@ -206,11 +244,9 @@ def metrics_for(ticker: str) -> Dict:
         if px.empty:
             raise RuntimeError("No price history")
 
-        # last price
         price_fast = _to_float(fast.get("last_price"))
         price = price_fast if np.isfinite(price_fast) and price_fast > 0 else float(px.iloc[-1])
 
-        # 52w low/high from fast or last-1y history
         low_52w = fast.get("year_low"); high_52w = fast.get("year_high")
         if not (_is_num(low_52w) and _is_num(high_52w)):
             px1y = _hist_close(t, period="1y", interval="1d")
@@ -220,18 +256,15 @@ def metrics_for(ticker: str) -> Dict:
         else:
             low_52w, high_52w = float(low_52w), float(high_52w)
 
-        # GBX→GBP scaling
         if is_gbx:
             price *= 0.01
             low_52w *= 0.01
             high_52w *= 0.01
             px = px * 0.01
 
-        # position in 52w band
         rng = high_52w - low_52w
         pos_52w = (price - low_52w) / (rng if _is_num(rng) and rng > 0 else np.nan)
 
-        # --- Dividends & yields
         try:
             div = t.get_dividends()
         except Exception:
@@ -245,7 +278,6 @@ def metrics_for(ticker: str) -> Dict:
             div_ttm = 0.0
         div_yield_ttm = (div_ttm / float(price)) if price and price > 0 else np.nan
 
-        # 5y median yield (fallback to available months)
         pm = px.resample("M").last()
         dm = div.resample("M").sum().reindex(pm.index, fill_value=0.0) if isinstance(div, pd.Series) and len(div) else pd.Series(0.0, index=pm.index)
         ttm_div_m = dm.rolling(12, min_periods=1).sum()
@@ -257,12 +289,10 @@ def metrics_for(ticker: str) -> Dict:
         else:
             yld_5y_med = np.nan
 
-        # Dividend cut heuristic (24m)
         div_ttm_current = float(ttm_div_m.iloc[-1]) if len(ttm_div_m) else 0.0
         div_ttm_prev = float(ttm_div_m.shift(12).iloc[-1]) if len(ttm_div_m) > 12 else np.nan
         div_cut_24m = int(np.isfinite(div_ttm_prev) and div_ttm_prev > 0 and (div_ttm_current < 0.9 * div_ttm_prev))
 
-        # --- Financials (TTM)
         q_is = t.quarterly_financials if hasattr(t, "quarterly_financials") else pd.DataFrame()
         q_bs = t.quarterly_balance_sheet if hasattr(t, "quarterly_balance_sheet") else pd.DataFrame()
         q_cf = t.quarterly_cashflow if hasattr(t, "quarterly_cashflow") else pd.DataFrame()
@@ -299,7 +329,6 @@ def metrics_for(ticker: str) -> Dict:
         fcf_margin = (fcf / revenue) if (np.isfinite(fcf) and np.isfinite(revenue) and revenue > 0) else np.nan
         ebitda_margin = (ebitda / revenue) if (np.isfinite(ebitda) and np.isfinite(revenue) and revenue > 0) else np.nan
 
-        # --- Beta (2y weekly) vs S&P 500 using history()
         try:
             spx = yf.Ticker("^GSPC").history(period="2y", interval="1wk", auto_adjust=True)["Close"].pct_change().dropna()
             stw = t.history(period="2y", interval="1wk", auto_adjust=True)["Close"].pct_change().dropna()
@@ -308,11 +337,9 @@ def metrics_for(ticker: str) -> Dict:
         except Exception:
             beta = np.nan
 
-        # Coverage / payout
         coverage_fcf = (fcf / div_cash_ttm) if (np.isfinite(fcf) and div_cash_ttm > 0) else np.inf
         fcf_payout   = (div_cash_ttm / fcf) if (np.isfinite(fcf) and fcf > 0) else np.inf
 
-        # Outlier flag for extreme yields
         err = np.nan
         if np.isfinite(div_yield_ttm) and div_yield_ttm > 0.25:
             err = "yield_outlier_check_currency"
@@ -341,15 +368,16 @@ def metrics_for(ticker: str) -> Dict:
     except Exception as e:
         return {"ticker": ticker, "error": str(e)}
 
-# =========================
-# Scoring
-# =========================
-WEIGHTS: Dict[str, float] = {
+# ─────────────────────────────────────────────────────────────
+# Scoring (editierbare Gewichte)
+# ─────────────────────────────────────────────────────────────
+DEFAULT_WEIGHTS: Dict[str, float] = {
     "sc_yield": 0.22, "sc_52w": 0.18, "sc_pe": 0.12, "sc_ev_ebitda": 0.12,
     "sc_de": 0.12, "sc_fcfm": 0.08, "sc_ebitdam": 0.06, "sc_beta": 0.06, "sc_ygap": 0.04,
 }
 
-def build_scores(df: pd.DataFrame) -> pd.DataFrame:
+def build_scores(df: pd.DataFrame, weights: Dict[str, float] | None = None) -> pd.DataFrame:
+    wdict = weights or DEFAULT_WEIGHTS
     d = df.copy()
     d["sc_yield"]     = (np.clip((d["div_yield_ttm"] - 0.05) / 0.05, 0, 1) * 100)
     d["sc_52w"]       = ((1 - d["pos_52w"]).clip(0, 1) * 100)
@@ -366,8 +394,8 @@ def build_scores(df: pd.DataFrame) -> pd.DataFrame:
                     np.nan)
     d["sc_ygap"] = _sector_percentile(pd.DataFrame({"sector": d["sector"], "ygap": ygap}), "ygap", invert=False)
 
-    S = d[list(WEIGHTS.keys())].astype(float)
-    w = pd.Series(WEIGHTS)
+    S = d[list(DEFAULT_WEIGHTS.keys())].astype(float)
+    w = pd.Series(wdict).reindex(S.columns).fillna(0.0)
     num = (S * w).sum(axis=1, skipna=True)
     den = ((~S.isna()) * w).sum(axis=1)
     d["score_raw"] = np.where(den > 0, num / den, np.nan)
@@ -384,9 +412,9 @@ def build_scores(df: pd.DataFrame) -> pd.DataFrame:
                             ["BUY", "ACCUMULATE/WATCH"], default="AVOID/HOLD")
     return d
 
-# =========================
+# ─────────────────────────────────────────────────────────────
 # Pipeline
-# =========================
+# ─────────────────────────────────────────────────────────────
 def run_scoring(
     tickers: Iterable[str],
     min_yield: float = 0.05,
@@ -395,6 +423,7 @@ def run_scoring(
     exclude_financials: bool = True,
     drop_prefilter_fails: bool = True,
     max_workers: int = 6,
+    weights: Dict[str, float] | None = None,
 ) -> pd.DataFrame:
     tickers = sorted({t.strip().upper() for t in tickers if t and isinstance(t, str)})
     if not tickers:
@@ -404,6 +433,7 @@ def run_scoring(
     pbar = st.progress(0.0, text="Kennzahlen: 0/0")
     total = len(tickers)
     done = 0
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(metrics_for, tk): tk for tk in tickers}
         for fut in as_completed(futs):
@@ -437,7 +467,7 @@ def run_scoring(
         out[num_cols] = out[num_cols].round(2)
         return out
 
-    scored = build_scores(base)
+    scored = build_scores(base, weights=weights)
     out = scored.copy()
     out["div_yield_%"] = out["div_yield_ttm"] * 100
     out["pos_52w_%"] = out["pos_52w"] * 100
@@ -448,9 +478,9 @@ def run_scoring(
     out[num_cols] = out[num_cols].round(2)
     return out
 
-# =========================
+# ─────────────────────────────────────────────────────────────
 # Sidebar – Inputs
-# =========================
+# ─────────────────────────────────────────────────────────────
 st.sidebar.header("📥 Eingabedaten")
 
 csv_file = st.sidebar.file_uploader("CSV mit Tickern hochladen", type=["csv"])
@@ -470,12 +500,31 @@ manual_syms = [s.strip().upper() for s in manual.split(",") if s.strip()] if man
 st.sidebar.subheader("📚 Index hinzufügen")
 index_choice = st.sidebar.selectbox(
     "Index",
-    ["– auswählen –", "DAX", "MDAX", "FTSE 100", "ATX", "Dow Jones 30", "S&P 500"]
+    [
+        "– auswählen –",
+        "DAX", "MDAX",
+        "FTSE 100", "FTSE 250",
+        "S&P 500",
+        "S&P 500 Div. Aristocrats",
+        "S&P 400 Div. Aristocrats",
+        "S&P/TSX 60",
+        "S&P/ASX 200",
+        "Dow Jones 30",
+    ]
 )
 index_syms = []
 if index_choice != "– auswählen –":
     try:
-        key_map = {"ftse 100":"ftse100", "dow jones 30":"dow jones 30", "s&p 500":"s&p 500"}
+        key_map = {
+            "ftse 100": "ftse100",
+            "ftse 250": "ftse250",
+            "dow jones 30": "dow jones 30",
+            "s&p 500": "s&p 500",
+            "s&p 500 div. aristocrats": "sp500_diva",
+            "s&p 400 div. aristocrats": "sp400_diva",
+            "s&p/tsx 60": "tsx60",
+            "s&p/asx 200": "asx200",
+        }
         idx_key = key_map.get(index_choice.lower(), index_choice)
         index_syms = load_index_members(idx_key)
         st.sidebar.info(f"{index_choice}: {len(index_syms)} Werte geladen")
@@ -485,6 +534,9 @@ if index_choice != "– auswählen –":
 watchlist = sorted({*uploaded_syms, *manual_syms, *index_syms})
 st.sidebar.caption(f"Gesamt-Watchlist: **{len(watchlist)}** Ticker")
 
+# ─────────────────────────────────────────────────────────────
+# Sidebar – Filter & editierbare Gewichte
+# ─────────────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Filter & Optionen")
 min_yield = st.sidebar.number_input("Min. Dividendenrendite", min_value=0.0, max_value=0.3, value=0.05, step=0.005, format="%.3f")
 min_mcap  = st.sidebar.number_input("Min. Market Cap (USD)", min_value=0.0, value=1_000_000_000.0, step=100_000_000.0, format="%.0f")
@@ -492,11 +544,54 @@ min_adv   = st.sidebar.number_input("Min. 3M ADV (Shares)", min_value=0.0, value
 exclude_financials = st.sidebar.checkbox("Finanzsektor ausschließen", value=True)
 drop_pf = st.sidebar.checkbox("Nur Pre-Filter-Pass zeigen", value=True)
 max_workers = st.sidebar.slider("Parallel-Worker", 1, 12, 6)
+
+st.sidebar.subheader("⚖️ Gewichte (Score-Komponenten)")
+if "weights" not in st.session_state:
+    st.session_state.weights = DEFAULT_WEIGHTS.copy()
+
+c_reset, c_norm = st.sidebar.columns([1,1])
+with c_reset:
+    if st.button("↩️ Standard", use_container_width=True):
+        st.session_state.weights = DEFAULT_WEIGHTS.copy()
+with c_norm:
+    auto_norm = st.checkbox("Normieren", value=True, help="Skaliert die Gewichte so, dass die Summe 1.0 ergibt")
+
+label_map = {
+    "sc_yield": "Yield",
+    "sc_52w": "52W-Position (umgekehrt)",
+    "sc_pe": "P/E (Sektor, invertiert)",
+    "sc_ev_ebitda": "EV/EBITDA (invertiert)",
+    "sc_de": "Debt/Equity (invertiert)",
+    "sc_fcfm": "FCF-Marge",
+    "sc_ebitdam": "EBITDA-Marge",
+    "sc_beta": "Beta",
+    "sc_ygap": "Yield-/Median-Gap",
+}
+
+tmp_weights = {}
+for k, default in DEFAULT_WEIGHTS.items():
+    tmp_weights[k] = st.sidebar.slider(
+        label_map.get(k, k),
+        0.0, 1.0,
+        float(st.session_state.weights.get(k, default)),
+        0.01
+    )
+
+total_w = sum(tmp_weights.values())
+if auto_norm and total_w > 0:
+    weights = {k: v / total_w for k, v in tmp_weights.items()}
+else:
+    weights = tmp_weights
+
+# persist current slider positions
+st.session_state.weights = tmp_weights
+st.sidebar.caption(f"Gewichtssumme: **{sum(weights.values()):.2f}**")
+
 run_btn = st.sidebar.button("🔎 Score berechnen", use_container_width=True)
 
-# =========================
+# ─────────────────────────────────────────────────────────────
 # Main – Output
-# =========================
+# ─────────────────────────────────────────────────────────────
 st.subheader("Watchlist")
 if watchlist:
     with st.expander(f"Watchlist anzeigen ({len(watchlist)} Ticker)"):
@@ -506,8 +601,11 @@ else:
 
 if run_btn and watchlist:
     df = run_scoring(
-        watchlist, min_yield=min_yield, min_mcap=min_mcap, min_adv=min_adv,
-        exclude_financials=exclude_financials, drop_prefilter_fails=drop_pf, max_workers=max_workers
+        watchlist,
+        min_yield=min_yield, min_mcap=min_mcap, min_adv=min_adv,
+        exclude_financials=exclude_financials, drop_prefilter_fails=drop_pf,
+        max_workers=max_workers,
+        weights=weights,
     )
 
     st.subheader("Ergebnisse")
@@ -557,4 +655,4 @@ if run_btn and watchlist:
             st.warning("Hinweise/Fehler beim Laden einiger Ticker:")
             st.dataframe(err_df, use_container_width=True)
 else:
-    st.caption("Tipp: Bei EU/UK-Werten Yahoo-Suffixe nutzen (.DE, .L, .VI, .PA, …).")
+    st.caption("Tipp: Bei EU/UK-Werten Yahoo-Suffixe nutzen (.DE, .L, .VI, .PA, .TO, .AX, …).")

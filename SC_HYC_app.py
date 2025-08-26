@@ -1,3 +1,4 @@
+# app.py
 # High-Yield Dividend Scoring – Streamlit (editierbare Gewichte, robuste Index-Auswahl, 403-fest)
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ def _make_session() -> requests.Session:
 _SESSION = _make_session()
 
 def _wiki_rest_html(url: str) -> str:
-    """Wenn Wikipedia-URL: HTML über REST-API (bot-freundlich)."""
+    """Wikipedia-URL über REST-API abrufen (bot-freundlich)."""
     try:
         from urllib.parse import urlparse
         p = urlparse(url)
@@ -71,10 +72,10 @@ def _wiki_rest_html(url: str) -> str:
         return ""
 
 def _get_html(url: str) -> str:
+    """Nie Exceptions werfen – bei Block oder Fehler leerer String."""
     html = _wiki_rest_html(url)
     if html:
         return html
-
     try:
         r = _SESSION.get(url, headers=HEADERS, timeout=25)
         if r.status_code == 403 and "wikipedia.org" in url:
@@ -83,20 +84,27 @@ def _get_html(url: str) -> str:
             )
             r = _SESSION.get(url_m, headers=HEADERS, timeout=25)
         if r.status_code == 403:
-            return ""  # <— KEIN raise mehr
+            return ""
         r.raise_for_status()
         return r.text
     except Exception:
-        return ""  # defensiv: auch hier nie Exception bubbles
+        return ""
 
+def _read_tables(html_text: str) -> list[pd.DataFrame]:
+    try:
+        return pd.read_html(html_text, flavor="lxml")
+    except Exception:
+        try:
+            return pd.read_html(html_text, flavor="bs4")
+        except Exception:
+            return []
 
 
 # ─────────────────────────────────────────────────────────────
-# Offline-Indexlisten (No-HTTP-Fallback, standardmäßig genutzt)
+# Offline-Indexlisten (No-HTTP-Fallback; bevorzugt)
 # ─────────────────────────────────────────────────────────────
 OFFLINE_TICKERS = {
     "dax": [
-        # Notfallliste (reicht für die App; kann leicht gepflegt werden)
         "ADS.DE","AIR.DE","ALV.DE","BAS.DE","BAYN.DE","BMW.DE","BNR.DE","CON.DE",
         "DB1.DE","DBK.DE","DHER.DE","DTE.DE","DPW.DE","DTG.DE","ENR.DE","EOAN.DE",
         "FME.DE","FRE.DE","HEI.DE","HEN3.DE","IFX.DE","LIN.DE","MBG.DE","MRK.DE",
@@ -215,7 +223,7 @@ def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
     return pd.Series(dtype=float)
 
 # ─────────────────────────────────────────────────────────────
-# Index-Mitglieder (Offline bevorzugt, Online-REST als Option)
+# Index-Mitglieder (Offline bevorzugt; Online-REST optional)
 # ─────────────────────────────────────────────────────────────
 def _pick_symbol_column(tbl: pd.DataFrame, prefer: list[str]) -> str | None:
     cols = [c for c in tbl.columns]
@@ -229,11 +237,11 @@ def _pick_symbol_column(tbl: pd.DataFrame, prefer: list[str]) -> str | None:
 def load_index_members(name: str, prefer_offline: bool = True) -> List[str]:
     name = name.lower().strip()
 
-    # Offline zuerst (403-sicher)
+    # 1) Offline zuerst (403-sicher, instant)
     if prefer_offline and name in OFFLINE_TICKERS:
         return OFFLINE_TICKERS[name]
 
-    # 2) Online-Quellen (REST + Fallbacks)
+    # 2) Online-Quellen (REST + Mobile-Fallback)
     URLS = {
         "dax": [
             "https://de.wikipedia.org/wiki/DAX",
@@ -273,13 +281,17 @@ def load_index_members(name: str, prefer_offline: bool = True) -> List[str]:
         "asx200": ["https://en.wikipedia.org/wiki/S%26P/ASX_200"],
     }
 
+    if name not in URLS and name in OFFLINE_TICKERS:
+        return OFFLINE_TICKERS[name]
     if name not in URLS:
-        raise ValueError(f"Unbekannter Index: {name}")
+        return []
 
     errors = []
     for url in URLS[name]:
         try:
             html = _get_html(url)
+            if not html:
+                raise RuntimeError("leer")
             tables = _read_tables(html)
             if not tables:
                 raise RuntimeError("Keine Tabellen gefunden")
@@ -316,18 +328,17 @@ def load_index_members(name: str, prefer_offline: bool = True) -> List[str]:
                 syms = syms.str.replace(".", "-", regex=False).tolist()
 
             syms = sorted({s for s in syms if s and len(s) <= 12})
-            if not syms:
-                raise RuntimeError("Tickerliste leer")
-            return syms
+            if syms:
+                return syms
         except Exception as e:
             errors.append(f"{url}: {e}")
-            time.sleep(0.5)
+            time.sleep(0.3)
             continue
 
     # 3) Offline als Rückfallebene
-   if name in OFFLINE_TICKERS:
+    if name in OFFLINE_TICKERS:
         return OFFLINE_TICKERS[name]
-    return []  # <— statt raise RuntimeError
+    return []  # nie raisen
 
 # ─────────────────────────────────────────────────────────────
 # Metrics (TTM, robust, GBX-fix)
@@ -604,42 +615,60 @@ manual_syms = [s.strip().upper() for s in manual.split(",") if s.strip()] if man
 
 st.sidebar.subheader("📚 Index hinzufügen")
 prefer_offline = st.sidebar.checkbox("Offline-Indexlisten bevorzugen (403-sicher)", value=True)
-
 index_choice = st.sidebar.selectbox(
     "Index",
-    ["– auswählen –","DAX","MDAX","FTSE 100","FTSE 250","S&P 500",
-     "S&P 500 Div. Aristocrats","S&P 400 Div. Aristocrats",
-     "S&P/TSX 60","S&P/ASX 200","Dow Jones 30"]
+    [
+        "– auswählen –",
+        "DAX", "MDAX",
+        "FTSE 100", "FTSE 250",
+        "S&P 500",
+        "S&P 500 Div. Aristocrats",
+        "S&P 400 Div. Aristocrats",
+        "S&P/TSX 60",
+        "S&P/ASX 200",
+        "Dow Jones 30",
+    ]
 )
-
 index_syms = []
 if index_choice != "– auswählen –":
     key_map = {
-        "ftse 100": "ftse100", "ftse 250": "ftse250",
-        "dow jones 30": "dow jones 30", "s&p 500": "s&p 500",
+        "ftse 100": "ftse100",
+        "ftse 250": "ftse250",
+        "dow jones 30": "dow jones 30",
+        "s&p 500": "s&p 500",
         "s&p 500 div. aristocrats": "sp500_diva",
         "s&p 400 div. aristocrats": "sp400_diva",
-        "s&p/tsx 60": "tsx60", "s&p/asx 200": "asx200",
+        "s&p/tsx 60": "tsx60",
+        "s&p/asx 200": "asx200",
     }
     idx_key = key_map.get(index_choice.lower(), index_choice).lower()
     try:
-        index_syms = load_index_members(idx_key, prefer_offline=prefer_offline)
-        if index_syms:
-            src = "Offline" if (prefer_offline and idx_key in OFFLINE_TICKERS) else "Online"
-            st.sidebar.info(f"{index_choice}: {len(index_syms)} Werte geladen • Quelle: {src}")
+        syms = load_index_members(idx_key, prefer_offline=prefer_offline)
+        if not syms and idx_key in OFFLINE_TICKERS:
+            # letzte Rückfallebene
+            syms = OFFLINE_TICKERS[idx_key]
+            st.sidebar.warning(f"{index_choice}: Online blockiert. Offline-Liste verwendet ({len(syms)}).")
+        elif syms:
+            src = "Offline" if (prefer_offline and idx_key in OFFLINE_TICKERS) else "Online (REST)"
+            st.sidebar.info(f"{index_choice}: {len(syms)} Werte geladen • Quelle: {src}")
         else:
-            raise RuntimeError("leere Indexliste")
-    except Exception as e:
-        # Niemals hart fehlschlagen – letzte Rückfallebene
+            st.sidebar.warning(f"{index_choice}: keine Werte gefunden.")
+        index_syms = syms
+    except Exception:
+        # Sollte praktisch nicht mehr vorkommen – trotzdem weich abfangen
         if idx_key in OFFLINE_TICKERS:
             index_syms = OFFLINE_TICKERS[idx_key]
-            st.sidebar.warning(f"{index_choice}: Online blockiert ({e}). Offline-Liste verwendet: {len(index_syms)}")
+            st.sidebar.warning(f"{index_choice}: Fallback aktiv. Offline-Liste verwendet ({len(index_syms)}).")
         else:
-            st.sidebar.error(f"{index_choice}: {e}")
-
+            st.sidebar.warning(f"{index_choice}: Konnte keine Liste laden.")
 
 watchlist = sorted({*uploaded_syms, *manual_syms, *index_syms})
 st.sidebar.caption(f"Gesamt-Watchlist: **{len(watchlist)}** Ticker")
+
+# Optional: Cache-Reset
+if st.sidebar.button("🧹 Cache leeren"):
+    st.cache_data.clear()
+    st.rerun()
 
 # ─────────────────────────────────────────────────────────────
 # Sidebar – Filter & editierbare Gewichte

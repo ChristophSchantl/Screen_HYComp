@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 import time
-from typing import Dict, List, Iterable
+from typing import Dict, List, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,7 @@ except Exception:
 st.set_page_config(page_title="High-Yield Dividend Scoring", layout="wide")
 st.title("📈 High-Yield Dividend Scoring")
 st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • robuste Datenlogik")
+
 
 # ─────────────────────────────────────────────────────────────
 # HTTP / Parsing – 403-sicher
@@ -54,7 +55,7 @@ def _make_session() -> requests.Session:
 _SESSION = _make_session()
 
 def _wiki_rest_html(url: str) -> str:
-    """Wikipedia-URL über REST-API abrufen (bot-freundlich)."""
+    """Wikipedia-URL via REST-API abrufen (bot-freundlich)."""
     try:
         from urllib.parse import urlparse
         p = urlparse(url)
@@ -72,7 +73,7 @@ def _wiki_rest_html(url: str) -> str:
         return ""
 
 def _get_html(url: str) -> str:
-    """Nie Exceptions werfen – bei Block oder Fehler leerer String."""
+    """Nie Exceptions werfen – bei Block/Fehler leerer String."""
     html = _wiki_rest_html(url)
     if html:
         return html
@@ -91,6 +92,8 @@ def _get_html(url: str) -> str:
         return ""
 
 def _read_tables(html_text: str) -> list[pd.DataFrame]:
+    if not html_text:
+        return []
     try:
         return pd.read_html(html_text, flavor="lxml")
     except Exception:
@@ -225,54 +228,58 @@ def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
 # ─────────────────────────────────────────────────────────────
 # Index-Mitglieder (Offline bevorzugt; Online-REST optional)
 # ─────────────────────────────────────────────────────────────
-def _pick_symbol_column(tbl: pd.DataFrame, prefer: list[str]) -> str | None:
-    cols = [c for c in tbl.columns]
-    for want in prefer:
-        for c in cols:
-            if want in str(c).lower():
-                return c
-    return None
+def _safe_load_from_urls(name: str, urls: List[str]) -> List[str]:
+    """Versuche Online-Abruf. Liefert Liste oder []. Nie raise."""
+    for url in urls:
+        html = _get_html(url)
+        tables = _read_tables(html)
+        if not tables:
+            continue
+        # passende Spalte finden
+        col = None
+        for tb in tables:
+            for p in ("symbol", "ticker", "epic", "code"):
+                for c in tb.columns:
+                    if p in str(c).lower():
+                        col = c; tbl = tb; break
+                if col: break
+            if col: break
+        if not col:
+            tbl = tables[0]; col = tbl.columns[0]
+        syms = _clean_symbols(tbl[col])
+        if name in {"dax","mdax"}:
+            syms = _apply_suffix(syms.tolist(), ".DE")
+        elif name in {"ftse100","ftse250"}:
+            syms = _apply_suffix(syms.tolist(), ".L")
+        elif name == "tsx60":
+            syms = _apply_suffix(syms.tolist(), ".TO")
+        elif name == "asx200":
+            syms = _apply_suffix(syms.tolist(), ".AX")
+        else:
+            syms = syms.str.replace(".", "-", regex=False).tolist()
+        out = sorted({s for s in syms if s and len(s) <= 12})
+        if out:
+            return out
+        time.sleep(0.2)
+    return []
 
 @st.cache_data(ttl=60*60*12, show_spinner=False)
-def load_index_members(name: str, prefer_offline: bool = True) -> List[str]:
+def load_index_members(name: str, prefer_offline: bool = True) -> Tuple[List[str], str]:
+    """Gibt (tickers, source_label) zurück. Nie Exceptions."""
     name = name.lower().strip()
 
-    # 1) Offline zuerst (403-sicher, instant)
+    # 1) Offline zuerst
     if prefer_offline and name in OFFLINE_TICKERS:
-        return OFFLINE_TICKERS[name]
+        return OFFLINE_TICKERS[name], "Offline"
 
-    # 2) Online-Quellen (REST + Mobile-Fallback)
     URLS = {
-        "dax": [
-            "https://de.wikipedia.org/wiki/DAX",
-            "https://en.wikipedia.org/wiki/DAX",
-            "https://en.m.wikipedia.org/wiki/DAX",
-        ],
-        "mdax": [
-            "https://de.wikipedia.org/wiki/MDAX",
-            "https://en.wikipedia.org/wiki/MDAX",
-            "https://en.m.wikipedia.org/wiki/MDAX",
-        ],
-        "ftse100": [
-            "https://en.wikipedia.org/wiki/FTSE_100_Index",
-            "https://en.m.wikipedia.org/wiki/FTSE_100_Index",
-        ],
-        "ftse250": [
-            "https://en.wikipedia.org/wiki/FTSE_250_Index",
-            "https://en.m.wikipedia.org/wiki/FTSE_250_Index",
-        ],
-        "dow": [
-            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-            "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-        ],
-        "djia": [
-            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-            "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-        ],
-        "dow jones 30": [
-            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-            "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-        ],
+        "dax": ["https://de.wikipedia.org/wiki/DAX","https://en.wikipedia.org/wiki/DAX","https://en.m.wikipedia.org/wiki/DAX"],
+        "mdax": ["https://de.wikipedia.org/wiki/MDAX","https://en.wikipedia.org/wiki/MDAX","https://en.m.wikipedia.org/wiki/MDAX"],
+        "ftse100": ["https://en.wikipedia.org/wiki/FTSE_100_Index","https://en.m.wikipedia.org/wiki/FTSE_100_Index"],
+        "ftse250": ["https://en.wikipedia.org/wiki/FTSE_250_Index","https://en.m.wikipedia.org/wiki/FTSE_250_Index"],
+        "dow": ["https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average","https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average"],
+        "djia": ["https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average","https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average"],
+        "dow jones 30": ["https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average","https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average"],
         "sp500": ["https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"],
         "s&p 500": ["https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"],
         "sp500_diva": ["https://en.wikipedia.org/wiki/S%26P_500_Dividend_Aristocrats"],
@@ -282,63 +289,18 @@ def load_index_members(name: str, prefer_offline: bool = True) -> List[str]:
     }
 
     if name not in URLS and name in OFFLINE_TICKERS:
-        return OFFLINE_TICKERS[name]
+        return OFFLINE_TICKERS[name], "Offline"
     if name not in URLS:
-        return []
+        return [], "Unbekannt"
 
-    errors = []
-    for url in URLS[name]:
-        try:
-            html = _get_html(url)
-            if not html:
-                raise RuntimeError("leer")
-            tables = _read_tables(html)
-            if not tables:
-                raise RuntimeError("Keine Tabellen gefunden")
-
-            def pick_col(tb: pd.DataFrame) -> str | None:
-                pref = ["symbol", "ticker", "epic", "code"]
-                for p in pref:
-                    for c in tb.columns:
-                        if p in str(c).lower():
-                            return c
-                return None
-
-            tbl = None; col = None
-            for tb in tables:
-                col = pick_col(tb)
-                if col is not None:
-                    tbl = tb
-                    break
-            if tbl is None or col is None:
-                tbl = tables[0]; col = tbl.columns[0]
-
-            syms = _clean_symbols(tbl[col])
-
-            # Suffix/Format
-            if name in {"dax", "mdax"}:
-                syms = _apply_suffix(syms.tolist(), ".DE")
-            elif name in {"ftse100", "ftse250"}:
-                syms = _apply_suffix(syms.tolist(), ".L")
-            elif name == "tsx60":
-                syms = _apply_suffix(syms.tolist(), ".TO")
-            elif name == "asx200":
-                syms = _apply_suffix(syms.tolist(), ".AX")
-            else:
-                syms = syms.str.replace(".", "-", regex=False).tolist()
-
-            syms = sorted({s for s in syms if s and len(s) <= 12})
-            if syms:
-                return syms
-        except Exception as e:
-            errors.append(f"{url}: {e}")
-            time.sleep(0.3)
-            continue
+    online = _safe_load_from_urls(name, URLS[name])
+    if online:
+        return online, "Online (REST)"
 
     # 3) Offline als Rückfallebene
     if name in OFFLINE_TICKERS:
-        return OFFLINE_TICKERS[name]
-    return []  # nie raisen
+        return OFFLINE_TICKERS[name], "Offline"
+    return [], "Leer"
 
 # ─────────────────────────────────────────────────────────────
 # Metrics (TTM, robust, GBX-fix)
@@ -493,22 +455,24 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     "sc_de": 0.12, "sc_fcfm": 0.08, "sc_ebitdam": 0.06, "sc_beta": 0.06, "sc_ygap": 0.04,
 }
 
-def build_scores(df: pd.DataFrame, weights: Dict[str, float] | None = None) -> pd.DataFrame:
-    wdict = weights or DEFAULT_WEIGHTS
-    d = df.copy()
-    d["sc_yield"]     = (np.clip((d["div_yield_ttm"] - 0.05) / 0.05, 0, 1) * 100)
-    d["sc_52w"]       = ((1 - d["pos_52w"]).clip(0, 1) * 100)
+def _sector_percentile_wrapper(d: pd.DataFrame) -> pd.DataFrame:
     d["sc_pe"]        = _sector_percentile(d, "pe_ttm", invert=True)
     d["sc_ev_ebitda"] = _sector_percentile(d, "ev_ebitda_ttm", invert=True)
     d["sc_de"]        = _sector_percentile(d, "de_ratio", invert=True)
     d.loc[~np.isfinite(d["de_ratio"]) | (d["de_ratio"] < 0), "sc_de"] = 0
     d["sc_fcfm"]      = _sector_percentile(d, "fcf_margin_ttm", invert=False)
     d["sc_ebitdam"]   = _sector_percentile(d, "ebitda_margin_ttm", invert=False)
-    d["sc_beta"]      = d["beta_2y_w"].apply(lambda b: _map_beta(b) if np.isfinite(b) else 50.0)
+    return d
 
-    ygap = np.where(d["yield_5y_median"] > 0,
-                    d["div_yield_ttm"] / d["yield_5y_median"] - 1.0,
-                    np.nan)
+def build_scores(df: pd.DataFrame, weights: Dict[str, float] | None = None) -> pd.DataFrame:
+    wdict = weights or DEFAULT_WEIGHTS
+    d = df.copy()
+    d["sc_yield"] = (np.clip((d["div_yield_ttm"] - 0.05) / 0.05, 0, 1) * 100)
+    d["sc_52w"]   = ((1 - d["pos_52w"]).clip(0, 1) * 100)
+    d             = _sector_percentile_wrapper(d)
+    d["sc_beta"]  = d["beta_2y_w"].apply(lambda b: _map_beta(b) if np.isfinite(b) else 50.0)
+
+    ygap = np.where(d["yield_5y_median"] > 0, d["div_yield_ttm"] / d["yield_5y_median"] - 1.0, np.nan)
     d["sc_ygap"] = _sector_percentile(pd.DataFrame({"sector": d["sector"], "ygap": ygap}), "ygap", invert=False)
 
     S = d[list(DEFAULT_WEIGHTS.keys())].astype(float)
@@ -629,8 +593,8 @@ index_choice = st.sidebar.selectbox(
         "Dow Jones 30",
     ]
 )
-index_syms = []
-if index_choice != "– auswählen –":
+
+def _ui_load_index(index_choice: str) -> Tuple[List[str], str]:
     key_map = {
         "ftse 100": "ftse100",
         "ftse 250": "ftse250",
@@ -642,25 +606,19 @@ if index_choice != "– auswählen –":
         "s&p/asx 200": "asx200",
     }
     idx_key = key_map.get(index_choice.lower(), index_choice).lower()
-    try:
-        syms = load_index_members(idx_key, prefer_offline=prefer_offline)
-        if not syms and idx_key in OFFLINE_TICKERS:
-            # letzte Rückfallebene
-            syms = OFFLINE_TICKERS[idx_key]
-            st.sidebar.warning(f"{index_choice}: Online blockiert. Offline-Liste verwendet ({len(syms)}).")
-        elif syms:
-            src = "Offline" if (prefer_offline and idx_key in OFFLINE_TICKERS) else "Online (REST)"
-            st.sidebar.info(f"{index_choice}: {len(syms)} Werte geladen • Quelle: {src}")
-        else:
-            st.sidebar.warning(f"{index_choice}: keine Werte gefunden.")
-        index_syms = syms
-    except Exception:
-        # Sollte praktisch nicht mehr vorkommen – trotzdem weich abfangen
-        if idx_key in OFFLINE_TICKERS:
-            index_syms = OFFLINE_TICKERS[idx_key]
-            st.sidebar.warning(f"{index_choice}: Fallback aktiv. Offline-Liste verwendet ({len(index_syms)}).")
-        else:
-            st.sidebar.warning(f"{index_choice}: Konnte keine Liste laden.")
+    syms, src = load_index_members(idx_key, prefer_offline=prefer_offline)
+    if not syms and idx_key in OFFLINE_TICKERS:
+        syms, src = OFFLINE_TICKERS[idx_key], "Offline"
+    return syms, src
+
+index_syms: List[str] = []
+if index_choice != "– auswählen –":
+    syms, src = _ui_load_index(index_choice)
+    index_syms = syms
+    if index_syms:
+        st.sidebar.info(f"{index_choice}: {len(index_syms)} Werte geladen • Quelle: {src}")
+    else:
+        st.sidebar.warning(f"{index_choice}: keine Werte gefunden (Quelle: {src}).")
 
 watchlist = sorted({*uploaded_syms, *manual_syms, *index_syms})
 st.sidebar.caption(f"Gesamt-Watchlist: **{len(watchlist)}** Ticker")

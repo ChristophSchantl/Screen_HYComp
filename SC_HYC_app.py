@@ -1,5 +1,5 @@
 # app.py
-# High-Yield Dividend Scoring – Streamlit (editierbare Gewichte, robuste Index-Auswahl, 403-fest)
+# High-Yield Dividend Scoring – Streamlit (editierbare Gewichte, 403-feste Index-Auswahl, Offline-Fallback)
 
 from __future__ import annotations
 import time
@@ -24,15 +24,11 @@ st.set_page_config(page_title="High-Yield Dividend Scoring", layout="wide")
 st.title("📈 High-Yield Dividend Scoring")
 st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • robuste Datenlogik")
 
-
 # ─────────────────────────────────────────────────────────────
 # HTTP / Parsing – 403-sicher
 # ─────────────────────────────────────────────────────────────
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
     "Accept-Language": "de,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Referer": "https://en.wikipedia.org/",
@@ -55,7 +51,7 @@ def _make_session() -> requests.Session:
 _SESSION = _make_session()
 
 def _wiki_rest_html(url: str) -> str:
-    """Wikipedia-URL via REST-API abrufen (bot-freundlich)."""
+    """Versuche Wikipedia über REST-API (bot-freundlich). Bei Problemen: ''."""
     try:
         from urllib.parse import urlparse
         p = urlparse(url)
@@ -64,7 +60,7 @@ def _wiki_rest_html(url: str) -> str:
         title = p.path.split("/wiki/")[1]
         rest = f"{p.scheme}://{p.netloc}/api/rest_v1/page/html/{title}"
         hdr = dict(HEADERS); hdr["Accept"] = "text/html"
-        r = _SESSION.get(rest, headers=hdr, timeout=25)
+        r = _SESSION.get(rest, headers=hdr, timeout=20)
         if r.status_code == 403:
             return ""
         r.raise_for_status()
@@ -73,17 +69,16 @@ def _wiki_rest_html(url: str) -> str:
         return ""
 
 def _get_html(url: str) -> str:
-    """Nie Exceptions werfen – bei Block/Fehler leerer String."""
+    """Nie Exceptions werfen – im Fehlerfall '' zurück."""
     html = _wiki_rest_html(url)
     if html:
         return html
     try:
-        r = _SESSION.get(url, headers=HEADERS, timeout=25)
+        r = _SESSION.get(url, headers=HEADERS, timeout=20)
         if r.status_code == 403 and "wikipedia.org" in url:
-            url_m = url.replace("://en.wikipedia.org/", "://en.m.wikipedia.org/").replace(
-                "://de.wikipedia.org/", "://de.m.wikipedia.org/"
-            )
-            r = _SESSION.get(url_m, headers=HEADERS, timeout=25)
+            url = url.replace("://en.wikipedia.org/", "://en.m.wikipedia.org/") \
+                     .replace("://de.wikipedia.org/", "://de.m.wikipedia.org/")
+            r = _SESSION.get(url, headers=HEADERS, timeout=20)
         if r.status_code == 403:
             return ""
         r.raise_for_status()
@@ -101,7 +96,6 @@ def _read_tables(html_text: str) -> list[pd.DataFrame]:
             return pd.read_html(html_text, flavor="bs4")
         except Exception:
             return []
-
 
 # ─────────────────────────────────────────────────────────────
 # Offline-Indexlisten (No-HTTP-Fallback; bevorzugt)
@@ -226,17 +220,16 @@ def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
     return pd.Series(dtype=float)
 
 # ─────────────────────────────────────────────────────────────
-# Index-Mitglieder (Offline bevorzugt; Online-REST optional)
+# Index-Mitglieder (Offline zuerst; Online als leiser Versuch)
 # ─────────────────────────────────────────────────────────────
 def _safe_load_from_urls(name: str, urls: List[str]) -> List[str]:
-    """Versuche Online-Abruf. Liefert Liste oder []. Nie raise."""
     for url in urls:
         html = _get_html(url)
         tables = _read_tables(html)
         if not tables:
             continue
         # passende Spalte finden
-        col = None
+        col = None; tbl = None
         for tb in tables:
             for p in ("symbol", "ticker", "epic", "code"):
                 for c in tb.columns:
@@ -265,10 +258,10 @@ def _safe_load_from_urls(name: str, urls: List[str]) -> List[str]:
 
 @st.cache_data(ttl=60*60*12, show_spinner=False)
 def load_index_members(name: str, prefer_offline: bool = True) -> Tuple[List[str], str]:
-    """Gibt (tickers, source_label) zurück. Nie Exceptions."""
+    """(tickers, source_label) – nie Exceptions."""
     name = name.lower().strip()
 
-    # 1) Offline zuerst
+    # 1) Offline zuerst (403-sicher)
     if prefer_offline and name in OFFLINE_TICKERS:
         return OFFLINE_TICKERS[name], "Offline"
 
@@ -295,7 +288,7 @@ def load_index_members(name: str, prefer_offline: bool = True) -> Tuple[List[str
 
     online = _safe_load_from_urls(name, URLS[name])
     if online:
-        return online, "Online (REST)"
+        return online, "Online"
 
     # 3) Offline als Rückfallebene
     if name in OFFLINE_TICKERS:
@@ -303,7 +296,7 @@ def load_index_members(name: str, prefer_offline: bool = True) -> Tuple[List[str
     return [], "Leer"
 
 # ─────────────────────────────────────────────────────────────
-# Metrics (TTM, robust, GBX-fix)
+# Metrics (TTM, robust, GBX-Fix)
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60*30, show_spinner=False)
 def metrics_for(ticker: str) -> Dict:
@@ -336,10 +329,7 @@ def metrics_for(ticker: str) -> Dict:
             low_52w, high_52w = float(low_52w), float(high_52w)
 
         if is_gbx:
-            price *= 0.01
-            low_52w *= 0.01
-            high_52w *= 0.01
-            px = px * 0.01
+            price *= 0.01; low_52w *= 0.01; high_52w *= 0.01; px = px * 0.01
 
         rng = high_52w - low_52w
         pos_52w = (price - low_52w) / (rng if _is_num(rng) and rng > 0 else np.nan)
@@ -361,12 +351,7 @@ def metrics_for(ticker: str) -> Dict:
         dm = div.resample("M").sum().reindex(pm.index, fill_value=0.0) if isinstance(div, pd.Series) and len(div) else pd.Series(0.0, index=pm.index)
         ttm_div_m = dm.rolling(12, min_periods=1).sum()
         yld_m = (ttm_div_m / pm).dropna()
-        if len(yld_m):
-            months = min(60, len(yld_m))
-            start = yld_m.index.max() - pd.DateOffset(months=months)
-            yld_5y_med = float(yld_m.loc[yld_m.index >= start].median())
-        else:
-            yld_5y_med = np.nan
+        yld_5y_med = float(yld_m.tail(min(60, len(yld_m))).median()) if len(yld_m) else np.nan
 
         div_ttm_current = float(ttm_div_m.iloc[-1]) if len(ttm_div_m) else 0.0
         div_ttm_prev = float(ttm_div_m.shift(12).iloc[-1]) if len(ttm_div_m) > 12 else np.nan
@@ -448,38 +433,32 @@ def metrics_for(ticker: str) -> Dict:
         return {"ticker": ticker, "error": str(e)}
 
 # ─────────────────────────────────────────────────────────────
-# Scoring (editierbare Gewichte)
+# Scoring
 # ─────────────────────────────────────────────────────────────
 DEFAULT_WEIGHTS: Dict[str, float] = {
     "sc_yield": 0.22, "sc_52w": 0.18, "sc_pe": 0.12, "sc_ev_ebitda": 0.12,
     "sc_de": 0.12, "sc_fcfm": 0.08, "sc_ebitdam": 0.06, "sc_beta": 0.06, "sc_ygap": 0.04,
 }
 
-def _sector_percentile_wrapper(d: pd.DataFrame) -> pd.DataFrame:
-    d["sc_pe"]        = _sector_percentile(d, "pe_ttm", invert=True)
-    d["sc_ev_ebitda"] = _sector_percentile(d, "ev_ebitda_ttm", invert=True)
-    d["sc_de"]        = _sector_percentile(d, "de_ratio", invert=True)
-    d.loc[~np.isfinite(d["de_ratio"]) | (d["de_ratio"] < 0), "sc_de"] = 0
-    d["sc_fcfm"]      = _sector_percentile(d, "fcf_margin_ttm", invert=False)
-    d["sc_ebitdam"]   = _sector_percentile(d, "ebitda_margin_ttm", invert=False)
-    return d
-
 def build_scores(df: pd.DataFrame, weights: Dict[str, float] | None = None) -> pd.DataFrame:
     wdict = weights or DEFAULT_WEIGHTS
     d = df.copy()
-    d["sc_yield"] = (np.clip((d["div_yield_ttm"] - 0.05) / 0.05, 0, 1) * 100)
-    d["sc_52w"]   = ((1 - d["pos_52w"]).clip(0, 1) * 100)
-    d             = _sector_percentile_wrapper(d)
-    d["sc_beta"]  = d["beta_2y_w"].apply(lambda b: _map_beta(b) if np.isfinite(b) else 50.0)
+    d["sc_yield"]   = (np.clip((d["div_yield_ttm"] - 0.05) / 0.05, 0, 1) * 100)
+    d["sc_52w"]     = ((1 - d["pos_52w"]).clip(0, 1) * 100)
+    d["sc_pe"]      = _sector_percentile(d, "pe_ttm", invert=True)
+    d["sc_ev_ebitda"]= _sector_percentile(d, "ev_ebitda_ttm", invert=True)
+    d["sc_de"]      = _sector_percentile(d, "de_ratio", invert=True)
+    d.loc[~np.isfinite(d["de_ratio"]) | (d["de_ratio"] < 0), "sc_de"] = 0
+    d["sc_fcfm"]    = _sector_percentile(d, "fcf_margin_ttm", invert=False)
+    d["sc_ebitdam"] = _sector_percentile(d, "ebitda_margin_ttm", invert=False)
+    d["sc_beta"]    = d["beta_2y_w"].apply(lambda b: _map_beta(b) if np.isfinite(b) else 50.0)
 
     ygap = np.where(d["yield_5y_median"] > 0, d["div_yield_ttm"] / d["yield_5y_median"] - 1.0, np.nan)
-    d["sc_ygap"] = _sector_percentile(pd.DataFrame({"sector": d["sector"], "ygap": ygap}), "ygap", invert=False)
+    d["sc_ygap"]    = _sector_percentile(pd.DataFrame({"sector": d["sector"], "ygap": ygap}), "ygap", invert=False)
 
     S = d[list(DEFAULT_WEIGHTS.keys())].astype(float)
     w = pd.Series(wdict).reindex(S.columns).fillna(0.0)
-    num = (S * w).sum(axis=1, skipna=True)
-    den = ((~S.isna()) * w).sum(axis=1)
-    d["score_raw"] = np.where(den > 0, num / den, np.nan)
+    d["score_raw"] = np.where(((~S.isna())*w).sum(axis=1) > 0, (S*w).sum(axis=1), np.nan)
 
     cap = d["score_raw"].copy()
     cap = np.where(d["div_cut_24m"] == 1, np.minimum(cap, 59), cap)
@@ -488,7 +467,7 @@ def build_scores(df: pd.DataFrame, weights: Dict[str, float] | None = None) -> p
     cap = np.where((d["beta_2y_w"] > 1.5), cap - 10, cap)
     cap = np.where((d["pos_52w"] < 0.10) & ((d["fcf_margin_ttm"] <= 0) | (d["ebitda_margin_ttm"] <= 0)), np.minimum(cap, 49), cap)
 
-    d["score"] = pd.Series(cap, index=d.index).clip(0, 100)
+    d["score"]  = pd.Series(cap, index=d.index).clip(0, 100)
     d["rating"] = np.select([d["score"] >= 75, (d["score"] >= 60) & (d["score"] < 75)],
                             ["BUY", "ACCUMULATE/WATCH"], default="AVOID/HOLD")
     return d
@@ -510,19 +489,17 @@ def run_scoring(
     if not tickers:
         return pd.DataFrame(columns=EXPECTED_COLS)
 
-    rows, errors = [], []
+    rows = []
     pbar = st.progress(0.0, text="Kennzahlen: 0/0")
     total = len(tickers); done = 0
     from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(metrics_for, tk): tk for tk in tickers}
         for fut in as_completed(futs):
-            tk = futs[fut]
             try:
                 rows.append(fut.result())
             except Exception as e:
-                errors.append((tk, str(e)))
-                rows.append({"ticker": tk, "error": str(e)})
+                rows.append({"ticker": futs[fut], "error": str(e)})
             done += 1
             pbar.progress(done / total, text=f"Kennzahlen: {done}/{total}")
 
@@ -581,29 +558,17 @@ st.sidebar.subheader("📚 Index hinzufügen")
 prefer_offline = st.sidebar.checkbox("Offline-Indexlisten bevorzugen (403-sicher)", value=True)
 index_choice = st.sidebar.selectbox(
     "Index",
-    [
-        "– auswählen –",
-        "DAX", "MDAX",
-        "FTSE 100", "FTSE 250",
-        "S&P 500",
-        "S&P 500 Div. Aristocrats",
-        "S&P 400 Div. Aristocrats",
-        "S&P/TSX 60",
-        "S&P/ASX 200",
-        "Dow Jones 30",
-    ]
+    ["– auswählen –","DAX","MDAX","FTSE 100","FTSE 250","S&P 500",
+     "S&P 500 Div. Aristocrats","S&P 400 Div. Aristocrats","S&P/TSX 60","S&P/ASX 200","Dow Jones 30"]
 )
 
 def _ui_load_index(index_choice: str) -> Tuple[List[str], str]:
     key_map = {
-        "ftse 100": "ftse100",
-        "ftse 250": "ftse250",
-        "dow jones 30": "dow jones 30",
-        "s&p 500": "s&p 500",
+        "ftse 100": "ftse100", "ftse 250": "ftse250",
+        "dow jones 30": "dow jones 30", "s&p 500": "s&p 500",
         "s&p 500 div. aristocrats": "sp500_diva",
         "s&p 400 div. aristocrats": "sp400_diva",
-        "s&p/tsx 60": "tsx60",
-        "s&p/asx 200": "asx200",
+        "s&p/tsx 60": "tsx60", "s&p/asx 200": "asx200",
     }
     idx_key = key_map.get(index_choice.lower(), index_choice).lower()
     syms, src = load_index_members(idx_key, prefer_offline=prefer_offline)
@@ -623,7 +588,7 @@ if index_choice != "– auswählen –":
 watchlist = sorted({*uploaded_syms, *manual_syms, *index_syms})
 st.sidebar.caption(f"Gesamt-Watchlist: **{len(watchlist)}** Ticker")
 
-# Optional: Cache-Reset
+# Cache-Reset (gegen alte Exceptions im Cache)
 if st.sidebar.button("🧹 Cache leeren"):
     st.cache_data.clear()
     st.rerun()
@@ -651,33 +616,18 @@ with c_norm:
     auto_norm = st.checkbox("Normieren", value=True, help="Skaliert die Gewichte so, dass die Summe 1.0 ergibt")
 
 label_map = {
-    "sc_yield": "Yield",
-    "sc_52w": "52W-Position (umgekehrt)",
-    "sc_pe": "P/E (Sektor, invertiert)",
-    "sc_ev_ebitda": "EV/EBITDA (invertiert)",
-    "sc_de": "Debt/Equity (invertiert)",
-    "sc_fcfm": "FCF-Marge",
-    "sc_ebitdam": "EBITDA-Marge",
-    "sc_beta": "Beta",
-    "sc_ygap": "Yield-/Median-Gap",
+    "sc_yield": "Yield", "sc_52w": "52W-Position (umgekehrt)",
+    "sc_pe": "P/E (Sektor, invertiert)", "sc_ev_ebitda": "EV/EBITDA (invertiert)",
+    "sc_de": "Debt/Equity (invertiert)", "sc_fcfm": "FCF-Marge",
+    "sc_ebitdam": "EBITDA-Marge", "sc_beta": "Beta", "sc_ygap": "Yield-/Median-Gap",
 }
 
 tmp_weights = {}
 for k, default in DEFAULT_WEIGHTS.items():
-    tmp_weights[k] = st.sidebar.slider(
-        label_map.get(k, k),
-        0.0, 1.0,
-        float(st.session_state.weights.get(k, default)),
-        0.01
-    )
+    tmp_weights[k] = st.sidebar.slider(label_map.get(k, k), 0.0, 1.0, float(st.session_state.weights.get(k, default)), 0.01)
 
 total_w = sum(tmp_weights.values())
-if auto_norm and total_w > 0:
-    weights = {k: v / total_w for k, v in tmp_weights.items()}
-else:
-    weights = tmp_weights
-
-# persist current slider positions
+weights = {k: v / total_w for k, v in tmp_weights.items()} if (auto_norm and total_w > 0) else tmp_weights
 st.session_state.weights = tmp_weights
 st.sidebar.caption(f"Gewichtssumme: **{sum(weights.values()):.2f}**")
 
@@ -698,8 +648,7 @@ if run_btn and watchlist:
         watchlist,
         min_yield=min_yield, min_mcap=min_mcap, min_adv=min_adv,
         exclude_financials=exclude_financials, drop_prefilter_fails=drop_pf,
-        max_workers=max_workers,
-        weights=weights,
+        max_workers=max_workers, weights=weights,
     )
 
     st.subheader("Ergebnisse")
@@ -711,11 +660,9 @@ if run_btn and watchlist:
         c3.metric("AVOID/HOLD", int(counts.get("AVOID/HOLD", 0)))
         c4.metric("Total", len(df))
 
-        prefer_cols = [
-            "ticker","sector","price","div_yield_%","near_52w_low_%",
-            "pe_ttm","ev_ebitda_ttm","de_ratio","fcf_margin_ttm","ebitda_margin_ttm",
-            "beta_2y_w","market_cap","adv_3m","score","rating","error"
-        ]
+        prefer_cols = ["ticker","sector","price","div_yield_%","near_52w_low_%","pe_ttm","ev_ebitda_ttm",
+                       "de_ratio","fcf_margin_ttm","ebitda_margin_ttm","beta_2y_w","market_cap","adv_3m",
+                       "score","rating","error"]
         show_cols = [c for c in prefer_cols if c in df.columns]
         st.dataframe(
             df[show_cols],

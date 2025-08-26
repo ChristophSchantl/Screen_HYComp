@@ -1,5 +1,5 @@
-# app.py
-# High-Yield Dividend Scoring – Streamlit (editierbare Gewichte, bessere Index-Auswahl)
+
+# High-Yield Dividend Scoring – Streamlit (editierbare Gewichte, robuste Index-Auswahl, 403-fest)
 
 from __future__ import annotations
 import time
@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import requests
 
 # ─────────────────────────────────────────────────────────────
 # Seite
@@ -16,6 +17,32 @@ import yfinance as yf
 st.set_page_config(page_title="High-Yield Dividend Scoring", layout="wide")
 st.title("📈 High-Yield Dividend Scoring")
 st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • robuste Datenlogik")
+
+# ─────────────────────────────────────────────────────────────
+# HTTP / Parsing – gegen 403 absichern
+# ─────────────────────────────────────────────────────────────
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+    ),
+    "Accept-Language": "de,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+def _get_html(url: str) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    if r.status_code == 403:
+        raise PermissionError(f"403 Forbidden @ {url}")
+    r.raise_for_status()
+    return r.text
+
+def _read_tables(html_text: str) -> list[pd.DataFrame]:
+    # Erst lxml, dann bs4 – was eben verfügbar ist
+    try:
+        return pd.read_html(html_text, flavor="lxml")
+    except Exception:
+        return pd.read_html(html_text, flavor="bs4")
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
@@ -119,114 +146,121 @@ def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
     return pd.Series(dtype=float)
 
 # ─────────────────────────────────────────────────────────────
-# Index-Mitglieder (Wikipedia)
+# Index-Mitglieder (Wikipedia + Fallbacks, 403-fest)
 # ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=60*60*12)
+def _pick_symbol_column(tbl: pd.DataFrame, prefer: list[str]) -> str | None:
+    cols = [c for c in tbl.columns]
+    for want in prefer:
+        for c in cols:
+            if want in str(c).lower():
+                return c
+    return None
+
+@st.cache_data(ttl=60*60*12, show_spinner=False)
 def load_index_members(name: str) -> List[str]:
     name = name.lower().strip()
 
-    if name in {"dax", "dax40"}:
-        url = "https://en.wikipedia.org/wiki/DAX"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("ticker" in str(c).lower() or "symbol" in str(c).lower()
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("DAX constituents not found")
-        col = next(c for c in tbl.columns if "ticker" in str(c).lower() or "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".DE")
+    # Kandiaten-URLs pro Index (de/en als Fallback)
+    URLS = {
+        "dax": [
+            "https://de.wikipedia.org/wiki/DAX",
+            "https://en.wikipedia.org/wiki/DAX",
+        ],
+        "mdax": [
+            "https://de.wikipedia.org/wiki/MDAX",
+            "https://en.wikipedia.org/wiki/MDAX",
+        ],
+        "ftse100": [
+            "https://en.wikipedia.org/wiki/FTSE_100_Index",
+        ],
+        "ftse250": [
+            "https://en.wikipedia.org/wiki/FTSE_250_Index",
+        ],
+        "dow": [
+            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+        ],
+        "djia": [
+            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+        ],
+        "dow jones 30": [
+            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+        ],
+        "sp500": [
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        ],
+        "s&p 500": [
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        ],
+        "sp500_diva": [
+            "https://en.wikipedia.org/wiki/S%26P_500_Dividend_Aristocrats",
+        ],
+        "sp400_diva": [
+            "https://en.wikipedia.org/wiki/S%26P_400_Dividend_Aristocrats",
+        ],
+        "tsx60": [
+            "https://en.wikipedia.org/wiki/S%26P/TSX_60",
+        ],
+        "asx200": [
+            "https://en.wikipedia.org/wiki/S%26P/ASX_200",
+        ],
+    }
 
-    if name in {"mdax"}:
-        url = "https://en.wikipedia.org/wiki/MDAX"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("ticker" in str(c).lower() or "symbol" in str(c).lower()
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("MDAX constituents not found")
-        col = next(c for c in tbl.columns if "ticker" in str(c).lower() or "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".DE")
+    if name not in URLS:
+        raise ValueError(f"Unbekannter Index: {name}")
 
-    if name in {"ftse100", "ftse 100", "ftse 100 index"}:
-        url = "https://en.wikipedia.org/wiki/FTSE_100_Index"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any(("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower())
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("FTSE 100 constituents not found")
-        col = next(c for c in tbl.columns if ("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower()))
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".L")
+    errors: list[str] = []
+    for url in URLS[name]:
+        try:
+            html = _get_html(url)
+            tables = _read_tables(html)
+            if not tables:
+                raise RuntimeError("Keine Tabellen gefunden")
 
-    if name in {"ftse250", "ftse 250"}:
-        url = "https://en.wikipedia.org/wiki/FTSE_250_Index"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any(("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower())
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("FTSE 250 constituents not found")
-        col = next(c for c in tbl.columns if ("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower()))
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".L")
+            # Spaltenerkennung
+            prefer = ["symbol", "ticker", "epic", "code"]
+            tbl = None
+            col = None
+            for tb in tables:
+                col = _pick_symbol_column(tb, prefer)
+                if col is not None:
+                    tbl = tb
+                    break
+            if tbl is None or col is None:
+                # Worst-case: nimm erste Tabelle
+                tbl = tables[0]
+                col = tbl.columns[0]
 
-    if name in {"dow", "djia", "dow jones 30", "dow jones"}:
-        url = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("Dow 30 constituents not found")
-        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)  # BRK.B -> BRK-B
-        return syms.tolist()
+            syms = _clean_symbols(tbl[col])
 
-    if name in {"sp500", "s&p500", "s&p 500", "s&p", "s and p 500"}:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("S&P 500 constituents not found")
-        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)
-        return syms.tolist()
+            # Suffixe / Formatierungen
+            if name in {"dax", "mdax"}:
+                syms = _apply_suffix(syms.tolist(), ".DE")
+            elif name in {"ftse100", "ftse250"}:
+                syms = _apply_suffix(syms.tolist(), ".L")
+            elif name in {"tsx60"}:
+                syms = _apply_suffix(syms.tolist(), ".TO")
+            elif name in {"asx200"}:
+                syms = _apply_suffix(syms.tolist(), ".AX")
+            else:
+                # US: BRK.B -> BRK-B etc.
+                syms = syms.str.replace(".", "-", regex=False).tolist()
 
-    if name in {"sp500_diva", "s&p 500 dividend aristocrats"}:
-        url = "https://en.wikipedia.org/wiki/S%26P_500_Dividend_Aristocrats"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("S&P 500 Dividend Aristocrats not found")
-        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)
-        return syms.tolist()
+            # Aufräumen
+            syms = sorted({s for s in syms if s and len(s) <= 12})
+            if not syms:
+                raise RuntimeError("Tickerliste leer")
+            return syms
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+            time.sleep(0.6)
+            continue
 
-    if name in {"sp400_diva", "s&p 400 dividend aristocrats"}:
-        url = "https://en.wikipedia.org/wiki/S%26P_400_Dividend_Aristocrats"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("S&P 400 Dividend Aristocrats not found")
-        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)
-        return syms.tolist()
-
-    if name in {"tsx60", "s&p/tsx 60"}:
-        url = "https://en.wikipedia.org/wiki/S%26P/TSX_60"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any(("symbol" in str(c).lower()) or ("ticker" in str(c).lower())
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("S&P/TSX 60 constituents not found")
-        col = next(c for c in tbl.columns if ("symbol" in str(c).lower()) or ("ticker" in str(c).lower()))
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".TO")
-
-    if name in {"asx200", "s&p/asx 200"}:
-        url = "https://en.wikipedia.org/wiki/S%26P/ASX_200"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any(("code" in str(c).lower()) or ("symbol" in str(c).lower())
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("S&P/ASX 200 constituents not found")
-        col = next(c for c in tbl.columns if ("code" in str(c).lower()) or ("symbol" in str(c).lower()))
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".AX")
-
-    raise ValueError(f"Unbekannter Index: {name}")
+    raise RuntimeError("Index-Download fehlgeschlagen. Logs:\n" + "\n".join(errors))
 
 # ─────────────────────────────────────────────────────────────
 # Metrics (TTM, robust, GBX-fix)
 # ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=60*30)
+@st.cache_data(ttl=60*30, show_spinner=False)
 def metrics_for(ticker: str) -> Dict:
     t = yf.Ticker(ticker)
     try:
@@ -656,3 +690,4 @@ if run_btn and watchlist:
             st.dataframe(err_df, use_container_width=True)
 else:
     st.caption("Tipp: Bei EU/UK-Werten Yahoo-Suffixe nutzen (.DE, .L, .VI, .PA, .TO, .AX, …).")
+

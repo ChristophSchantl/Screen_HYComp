@@ -10,6 +10,13 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import requests
+from requests.adapters import HTTPAdapter
+try:
+    # neuere urllib3
+    from urllib3.util.retry import Retry
+except Exception:
+    from requests.packages.urllib3.util.retry import Retry  # fallback
+
 
 # ─────────────────────────────────────────────────────────────
 # Seite
@@ -21,28 +28,70 @@ st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • r
 # ─────────────────────────────────────────────────────────────
 # HTTP / Parsing – gegen 403 absichern
 # ─────────────────────────────────────────────────────────────
+# === PATCH: HTTP-Setup (ersetzt HEADERS/_get_html/_read_tables) ===
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
     ),
     "Accept-Language": "de,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://en.wikipedia.org/",
+    "Cache-Control": "no-cache",
 }
 
+def _make_session() -> requests.Session:
+    sess = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.6,
+        status_forcelist=(403, 429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+_SESSION = _make_session()
+
 def _get_html(url: str) -> str:
-    r = requests.get(url, headers=HEADERS, timeout=20)
+    r = _SESSION.get(url, headers=HEADERS, timeout=25)
     if r.status_code == 403:
+        # explizite Meldung, damit du siehst welche URL blockt
         raise PermissionError(f"403 Forbidden @ {url}")
     r.raise_for_status()
     return r.text
 
 def _read_tables(html_text: str) -> list[pd.DataFrame]:
-    # Erst lxml, dann bs4 – was eben verfügbar ist
+    # erst lxml, dann bs4
     try:
         return pd.read_html(html_text, flavor="lxml")
     except Exception:
         return pd.read_html(html_text, flavor="bs4")
+
+
+# === PATCH: Offline-Fallback nur für DAX (falls alles blockiert) ===
+OFFLINE_TICKERS = {
+    "dax": [
+        # Stand 2025 – kann geringfügig abweichen; reicht als Notfall
+        "ADS.DE","AIR.DE","ALV.DE","BAS.DE","BAYN.DE","BMW.DE","BNR.DE","CON.DE",
+        "DAI.DE","DB1.DE","DBK.DE","DHER.DE","DTE.DE","DPW.DE","DTG.DE","ENR.DE",
+        "EOAN.DE","FME.DE","FRE.DE","HEI.DE","HEN3.DE","IFX.DE","LIN.DE","MBG.DE",
+        "MRK.DE","MOR.DE","MUV2.DE","P911.DE","PAH3.DE","QIA.DE","RHM.DE","RWE.DE",
+        "SAP.DE","SIE.DE","SRT3.DE","SY1.DE","VNA.DE","VOW3.DE","ZAL.DE","ZOE.DE"
+    ],
+}
+
+
+
+
+
+
+
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
@@ -156,105 +205,95 @@ def _pick_symbol_column(tbl: pd.DataFrame, prefer: list[str]) -> str | None:
                 return c
     return None
 
+# === PATCH: load_index_members komplett ersetzen ===
 @st.cache_data(ttl=60*60*12, show_spinner=False)
 def load_index_members(name: str) -> List[str]:
     name = name.lower().strip()
 
-    # Kandiaten-URLs pro Index (de/en als Fallback)
     URLS = {
         "dax": [
             "https://de.wikipedia.org/wiki/DAX",
             "https://en.wikipedia.org/wiki/DAX",
+            "https://en.m.wikipedia.org/wiki/DAX",   # mobile Fallback
         ],
         "mdax": [
             "https://de.wikipedia.org/wiki/MDAX",
             "https://en.wikipedia.org/wiki/MDAX",
+            "https://en.m.wikipedia.org/wiki/MDAX",
         ],
-        "ftse100": [
-            "https://en.wikipedia.org/wiki/FTSE_100_Index",
-        ],
-        "ftse250": [
-            "https://en.wikipedia.org/wiki/FTSE_250_Index",
-        ],
-        "dow": [
-            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-        ],
-        "djia": [
-            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-        ],
-        "dow jones 30": [
-            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-        ],
-        "sp500": [
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-        ],
-        "s&p 500": [
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-        ],
-        "sp500_diva": [
-            "https://en.wikipedia.org/wiki/S%26P_500_Dividend_Aristocrats",
-        ],
-        "sp400_diva": [
-            "https://en.wikipedia.org/wiki/S%26P_400_Dividend_Aristocrats",
-        ],
-        "tsx60": [
-            "https://en.wikipedia.org/wiki/S%26P/TSX_60",
-        ],
-        "asx200": [
-            "https://en.wikipedia.org/wiki/S%26P/ASX_200",
-        ],
+        "ftse100": ["https://en.wikipedia.org/wiki/FTSE_100_Index",
+                    "https://en.m.wikipedia.org/wiki/FTSE_100_Index"],
+        "ftse250": ["https://en.wikipedia.org/wiki/FTSE_250_Index",
+                    "https://en.m.wikipedia.org/wiki/FTSE_250_Index"],
+        "dow": ["https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+                "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average"],
+        "djia": ["https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+                 "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average"],
+        "dow jones 30": ["https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+                         "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average"],
+        "sp500": ["https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"],
+        "s&p 500": ["https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"],
+        "sp500_diva": ["https://en.wikipedia.org/wiki/S%26P_500_Dividend_Aristocrats"],
+        "sp400_diva": ["https://en.wikipedia.org/wiki/S%26P_400_Dividend_Aristocrats"],
+        "tsx60": ["https://en.wikipedia.org/wiki/S%26P/TSX_60"],
+        "asx200": ["https://en.wikipedia.org/wiki/S%26P/ASX_200"],
     }
 
     if name not in URLS:
         raise ValueError(f"Unbekannter Index: {name}")
 
-    errors: list[str] = []
+    errors = []
     for url in URLS[name]:
         try:
-            html = _get_html(url)
+            html = _get_html(url)                  # <- niemals URL direkt an read_html
             tables = _read_tables(html)
             if not tables:
                 raise RuntimeError("Keine Tabellen gefunden")
 
-            # Spaltenerkennung
-            prefer = ["symbol", "ticker", "epic", "code"]
-            tbl = None
-            col = None
+            # passende Spalte finden
+            def pick_col(tb: pd.DataFrame) -> str | None:
+                pref = ["symbol", "ticker", "epic", "code"]
+                for p in pref:
+                    for c in tb.columns:
+                        if p in str(c).lower():
+                            return c
+                return None
+
+            tbl = None; col = None
             for tb in tables:
-                col = _pick_symbol_column(tb, prefer)
+                col = pick_col(tb)
                 if col is not None:
                     tbl = tb
                     break
             if tbl is None or col is None:
-                # Worst-case: nimm erste Tabelle
-                tbl = tables[0]
-                col = tbl.columns[0]
+                tbl = tables[0]; col = tbl.columns[0]
 
             syms = _clean_symbols(tbl[col])
 
-            # Suffixe / Formatierungen
+            # Suffix/Format
             if name in {"dax", "mdax"}:
                 syms = _apply_suffix(syms.tolist(), ".DE")
             elif name in {"ftse100", "ftse250"}:
                 syms = _apply_suffix(syms.tolist(), ".L")
-            elif name in {"tsx60"}:
+            elif name == "tsx60":
                 syms = _apply_suffix(syms.tolist(), ".TO")
-            elif name in {"asx200"}:
+            elif name == "asx200":
                 syms = _apply_suffix(syms.tolist(), ".AX")
             else:
-                # US: BRK.B -> BRK-B etc.
                 syms = syms.str.replace(".", "-", regex=False).tolist()
 
-            # Aufräumen
             syms = sorted({s for s in syms if s and len(s) <= 12})
             if not syms:
                 raise RuntimeError("Tickerliste leer")
             return syms
         except Exception as e:
             errors.append(f"{url}: {e}")
-            time.sleep(0.6)
+            time.sleep(0.5)
             continue
 
+    # letzter Rettungsanker: Offline-Liste (vermeidet 403-Abbruch)
+    if name in OFFLINE_TICKERS:
+        return OFFLINE_TICKERS[name]
     raise RuntimeError("Index-Download fehlgeschlagen. Logs:\n" + "\n".join(errors))
 
 # ─────────────────────────────────────────────────────────────

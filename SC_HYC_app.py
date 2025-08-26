@@ -1,4 +1,3 @@
-
 # High-Yield Dividend Scoring – Streamlit (editierbare Gewichte, robuste Index-Auswahl, 403-fest)
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ import yfinance as yf
 import requests
 from requests.adapters import HTTPAdapter
 try:
-    # neuere urllib3
     from urllib3.util.retry import Retry
 except Exception:
     from requests.packages.urllib3.util.retry import Retry  # fallback
@@ -26,7 +24,7 @@ st.title("📈 High-Yield Dividend Scoring")
 st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • robuste Datenlogik")
 
 # ─────────────────────────────────────────────────────────────
-# HTTP / Parsing – gegen 403 absichern
+# HTTP / Parsing – 403-sicher
 # ─────────────────────────────────────────────────────────────
 HEADERS = {
     "User-Agent": (
@@ -42,10 +40,7 @@ HEADERS = {
 def _make_session() -> requests.Session:
     sess = requests.Session()
     retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=0.6,
+        total=3, connect=3, read=3, backoff_factor=0.6,
         status_forcelist=(403, 429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET", "HEAD"]),
         raise_on_status=False,
@@ -58,7 +53,7 @@ def _make_session() -> requests.Session:
 _SESSION = _make_session()
 
 def _wiki_rest_html(url: str) -> str:
-    """Wenn URL zu Wikipedia zeigt, hole HTML über die REST-API (bot-freundlich)."""
+    """Wenn Wikipedia-URL: HTML über REST-API (bot-freundlich)."""
     try:
         from urllib.parse import urlparse
         p = urlparse(url)
@@ -66,55 +61,51 @@ def _wiki_rest_html(url: str) -> str:
             return ""
         title = p.path.split("/wiki/")[1]
         rest = f"{p.scheme}://{p.netloc}/api/rest_v1/page/html/{title}"
-        hdr = dict(HEADERS)
-        hdr["Accept"] = "text/html"
+        hdr = dict(HEADERS); hdr["Accept"] = "text/html"
         r = _SESSION.get(rest, headers=hdr, timeout=25)
         if r.status_code == 403:
-            return ""  # REST auch geblockt -> normaler Weg
+            return ""
         r.raise_for_status()
         return r.text
     except Exception:
         return ""
 
 def _get_html(url: str) -> str:
-    # 1) REST-API (wenn Wikipedia), 2) klassische Seite, 3) mobile Fallback
+    # 1) REST-API  2) klassisch  3) mobile Fallback
     html = _wiki_rest_html(url)
     if html:
         return html
-
     r = _SESSION.get(url, headers=HEADERS, timeout=25)
     if r.status_code == 403 and "wikipedia.org" in url:
-        # mobile Fallback
         url_m = url.replace("://en.wikipedia.org/", "://en.m.wikipedia.org/").replace(
             "://de.wikipedia.org/", "://de.m.wikipedia.org/"
         )
         r = _SESSION.get(url_m, headers=HEADERS, timeout=25)
-
     if r.status_code == 403:
         raise PermissionError(f"403 Forbidden @ {url}")
     r.raise_for_status()
     return r.text
 
 def _read_tables(html_text: str) -> list[pd.DataFrame]:
-    # erst lxml, dann bs4
     try:
         return pd.read_html(html_text, flavor="lxml")
     except Exception:
         return pd.read_html(html_text, flavor="bs4")
 
 
-# === Offline-Fallbacks (wenn alles blockiert) ===
+# ─────────────────────────────────────────────────────────────
+# Offline-Indexlisten (No-HTTP-Fallback, standardmäßig genutzt)
+# ─────────────────────────────────────────────────────────────
 OFFLINE_TICKERS = {
     "dax": [
-        # Stand 2025 – Notfallliste
+        # Notfallliste (reicht für die App; kann leicht gepflegt werden)
         "ADS.DE","AIR.DE","ALV.DE","BAS.DE","BAYN.DE","BMW.DE","BNR.DE","CON.DE",
-        "DAI.DE","DB1.DE","DBK.DE","DHER.DE","DTE.DE","DPW.DE","DTG.DE","ENR.DE",
-        "EOAN.DE","FME.DE","FRE.DE","HEI.DE","HEN3.DE","IFX.DE","LIN.DE","MBG.DE",
-        "MRK.DE","MOR.DE","MUV2.DE","P911.DE","PAH3.DE","QIA.DE","RHM.DE","RWE.DE",
-        "SAP.DE","SIE.DE","SRT3.DE","SY1.DE","VNA.DE","VOW3.DE","ZAL.DE","ZOE.DE"
+        "DB1.DE","DBK.DE","DHER.DE","DTE.DE","DPW.DE","DTG.DE","ENR.DE","EOAN.DE",
+        "FME.DE","FRE.DE","HEI.DE","HEN3.DE","IFX.DE","LIN.DE","MBG.DE","MRK.DE",
+        "MOR.DE","MUV2.DE","P911.DE","PAH3.DE","QIA.DE","RHM.DE","RWE.DE","SAP.DE",
+        "SIE.DE","SRT3.DE","SY1.DE","VNA.DE","VOW3.DE","ZAL.DE","ZOE.DE"
     ],
     "ftse100": [
-        # Konservative Notfallliste (kann variieren)
         "AZN.L","SHEL.L","HSBA.L","BP.L","ULVR.L","GSK.L","BATS.L","RIO.L","DGE.L","NG.L",
         "REL.L","RKT.L","VOD.L","BARC.L","LLOY.L","PRU.L","AAL.L","BHP.L","IMB.L","SPX.L",
         "SSE.L","NXT.L","WTB.L","FERG.L","LSEG.L","EXPN.L","AUTO.L","IHG.L","CRDA.L","ABF.L",
@@ -159,7 +150,6 @@ def _sector_percentile(df: pd.DataFrame, col: str, invert: bool = False) -> pd.S
     return (p * 100).clip(0, 100)
 
 def _map_beta(b: float) -> float:
-    # 0.4→100, 0.8→70, 1.0→50, 1.5→0
     return float(np.interp(b, [0.4, 0.8, 1.0, 1.5], [100, 70, 50, 0], left=100, right=0))
 
 def _is_num(x) -> bool:
@@ -218,7 +208,6 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 # Kurs-Historie
 # ─────────────────────────────────────────────────────────────
 def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
-    """Immer Close per history() liefern."""
     try:
         h = t.history(period=period, interval=interval, auto_adjust=True)
         if isinstance(h, pd.DataFrame) and "Close" in h.columns:
@@ -228,7 +217,7 @@ def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
     return pd.Series(dtype=float)
 
 # ─────────────────────────────────────────────────────────────
-# Index-Mitglieder (Wikipedia + Fallbacks, 403-fest)
+# Index-Mitglieder (Offline bevorzugt, Online-REST als Option)
 # ─────────────────────────────────────────────────────────────
 def _pick_symbol_column(tbl: pd.DataFrame, prefer: list[str]) -> str | None:
     cols = [c for c in tbl.columns]
@@ -239,9 +228,14 @@ def _pick_symbol_column(tbl: pd.DataFrame, prefer: list[str]) -> str | None:
     return None
 
 @st.cache_data(ttl=60*60*12, show_spinner=False)
-def load_index_members(name: str) -> List[str]:
+def load_index_members(name: str, prefer_offline: bool = True) -> List[str]:
     name = name.lower().strip()
 
+    # 1) Offline bevorzugen
+    if prefer_offline and name in OFFLINE_TICKERS:
+        return OFFLINE_TICKERS[name]
+
+    # 2) Online-Quellen (REST + Fallbacks)
     URLS = {
         "dax": [
             "https://de.wikipedia.org/wiki/DAX",
@@ -287,12 +281,11 @@ def load_index_members(name: str) -> List[str]:
     errors = []
     for url in URLS[name]:
         try:
-            html = _get_html(url)  # via REST/Mobile/klassisch
+            html = _get_html(url)
             tables = _read_tables(html)
             if not tables:
                 raise RuntimeError("Keine Tabellen gefunden")
 
-            # passende Spalte finden
             def pick_col(tb: pd.DataFrame) -> str | None:
                 pref = ["symbol", "ticker", "epic", "code"]
                 for p in pref:
@@ -333,7 +326,7 @@ def load_index_members(name: str) -> List[str]:
             time.sleep(0.5)
             continue
 
-    # letzter Rettungsanker: Offline-Liste (vermeidet 403-Abbruch)
+    # 3) Offline als Rückfallebene
     if name in OFFLINE_TICKERS:
         return OFFLINE_TICKERS[name]
     raise RuntimeError("Index-Download fehlgeschlagen. Logs:\n" + "\n".join(errors))
@@ -546,8 +539,7 @@ def run_scoring(
 
     rows, errors = [], []
     pbar = st.progress(0.0, text="Kennzahlen: 0/0")
-    total = len(tickers)
-    done = 0
+    total = len(tickers); done = 0
     from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(metrics_for, tk): tk for tk in tickers}
@@ -613,6 +605,7 @@ manual = st.sidebar.text_area("Ticker manuell (kommasepariert)", placeholder="z.
 manual_syms = [s.strip().upper() for s in manual.split(",") if s.strip()] if manual else []
 
 st.sidebar.subheader("📚 Index hinzufügen")
+prefer_offline = st.sidebar.checkbox("Offline-Indexlisten bevorzugen (403-sicher)", value=True)
 index_choice = st.sidebar.selectbox(
     "Index",
     [
@@ -641,8 +634,9 @@ if index_choice != "– auswählen –":
             "s&p/asx 200": "asx200",
         }
         idx_key = key_map.get(index_choice.lower(), index_choice)
-        index_syms = load_index_members(idx_key)
-        st.sidebar.info(f"{index_choice}: {len(index_syms)} Werte geladen")
+        index_syms = load_index_members(idx_key, prefer_offline=prefer_offline)
+        src_label = "Offline-Liste" if (prefer_offline and idx_key in OFFLINE_TICKERS) else "Online (REST)"
+        st.sidebar.info(f"{index_choice}: {len(index_syms)} Werte geladen • Quelle: {src_label}")
     except Exception as e:
         st.sidebar.error(f"Index-Fehler: {e}")
 

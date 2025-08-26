@@ -28,7 +28,6 @@ st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • r
 # ─────────────────────────────────────────────────────────────
 # HTTP / Parsing – gegen 403 absichern
 # ─────────────────────────────────────────────────────────────
-# === PATCH: HTTP-Setup (ersetzt HEADERS/_get_html/_read_tables) ===
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -58,10 +57,40 @@ def _make_session() -> requests.Session:
 
 _SESSION = _make_session()
 
+def _wiki_rest_html(url: str) -> str:
+    """Wenn URL zu Wikipedia zeigt, hole HTML über die REST-API (bot-freundlich)."""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        if "wikipedia.org" not in p.netloc or "/wiki/" not in p.path:
+            return ""
+        title = p.path.split("/wiki/")[1]
+        rest = f"{p.scheme}://{p.netloc}/api/rest_v1/page/html/{title}"
+        hdr = dict(HEADERS)
+        hdr["Accept"] = "text/html"
+        r = _SESSION.get(rest, headers=hdr, timeout=25)
+        if r.status_code == 403:
+            return ""  # REST auch geblockt -> normaler Weg
+        r.raise_for_status()
+        return r.text
+    except Exception:
+        return ""
+
 def _get_html(url: str) -> str:
+    # 1) REST-API (wenn Wikipedia), 2) klassische Seite, 3) mobile Fallback
+    html = _wiki_rest_html(url)
+    if html:
+        return html
+
     r = _SESSION.get(url, headers=HEADERS, timeout=25)
+    if r.status_code == 403 and "wikipedia.org" in url:
+        # mobile Fallback
+        url_m = url.replace("://en.wikipedia.org/", "://en.m.wikipedia.org/").replace(
+            "://de.wikipedia.org/", "://de.m.wikipedia.org/"
+        )
+        r = _SESSION.get(url_m, headers=HEADERS, timeout=25)
+
     if r.status_code == 403:
-        # explizite Meldung, damit du siehst welche URL blockt
         raise PermissionError(f"403 Forbidden @ {url}")
     r.raise_for_status()
     return r.text
@@ -74,24 +103,28 @@ def _read_tables(html_text: str) -> list[pd.DataFrame]:
         return pd.read_html(html_text, flavor="bs4")
 
 
-# === PATCH: Offline-Fallback nur für DAX (falls alles blockiert) ===
+# === Offline-Fallbacks (wenn alles blockiert) ===
 OFFLINE_TICKERS = {
     "dax": [
-        # Stand 2025 – kann geringfügig abweichen; reicht als Notfall
+        # Stand 2025 – Notfallliste
         "ADS.DE","AIR.DE","ALV.DE","BAS.DE","BAYN.DE","BMW.DE","BNR.DE","CON.DE",
         "DAI.DE","DB1.DE","DBK.DE","DHER.DE","DTE.DE","DPW.DE","DTG.DE","ENR.DE",
         "EOAN.DE","FME.DE","FRE.DE","HEI.DE","HEN3.DE","IFX.DE","LIN.DE","MBG.DE",
         "MRK.DE","MOR.DE","MUV2.DE","P911.DE","PAH3.DE","QIA.DE","RHM.DE","RWE.DE",
         "SAP.DE","SIE.DE","SRT3.DE","SY1.DE","VNA.DE","VOW3.DE","ZAL.DE","ZOE.DE"
     ],
+    "ftse100": [
+        # Konservative Notfallliste (kann variieren)
+        "AZN.L","SHEL.L","HSBA.L","BP.L","ULVR.L","GSK.L","BATS.L","RIO.L","DGE.L","NG.L",
+        "REL.L","RKT.L","VOD.L","BARC.L","LLOY.L","PRU.L","AAL.L","BHP.L","IMB.L","SPX.L",
+        "SSE.L","NXT.L","WTB.L","FERG.L","LSEG.L","EXPN.L","AUTO.L","IHG.L","CRDA.L","ABF.L",
+        "BA.L","ANTO.L","BRBY.L","STAN.L","HLMA.L","HL.L","JD.L","ENT.L","PSN.L","TW.L",
+        "KGF.L","UU.L","SVT.L","BDEV.L","LAND.L","PSON.L","WPP.L","ADM.L","MNDI.L","SMDS.L",
+        "AVV.L","ICAG.L","BAE.L","AHT.L","BT-A.L","III.L","ITV.L","CNA.L","WEIR.L","MNG.L",
+        "NWG.L","LGEN.L","ABDN.L","STJ.L","DCC.L","INF.L","SGRO.L","BKG.L","AV.L","RSW.L",
+        "MRO.L","ICP.L","SMIN.L","RR.L","CPG.L"
+    ],
 }
-
-
-
-
-
-
-
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
@@ -205,7 +238,6 @@ def _pick_symbol_column(tbl: pd.DataFrame, prefer: list[str]) -> str | None:
                 return c
     return None
 
-# === PATCH: load_index_members komplett ersetzen ===
 @st.cache_data(ttl=60*60*12, show_spinner=False)
 def load_index_members(name: str) -> List[str]:
     name = name.lower().strip()
@@ -214,23 +246,33 @@ def load_index_members(name: str) -> List[str]:
         "dax": [
             "https://de.wikipedia.org/wiki/DAX",
             "https://en.wikipedia.org/wiki/DAX",
-            "https://en.m.wikipedia.org/wiki/DAX",   # mobile Fallback
+            "https://en.m.wikipedia.org/wiki/DAX",
         ],
         "mdax": [
             "https://de.wikipedia.org/wiki/MDAX",
             "https://en.wikipedia.org/wiki/MDAX",
             "https://en.m.wikipedia.org/wiki/MDAX",
         ],
-        "ftse100": ["https://en.wikipedia.org/wiki/FTSE_100_Index",
-                    "https://en.m.wikipedia.org/wiki/FTSE_100_Index"],
-        "ftse250": ["https://en.wikipedia.org/wiki/FTSE_250_Index",
-                    "https://en.m.wikipedia.org/wiki/FTSE_250_Index"],
-        "dow": ["https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-                "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average"],
-        "djia": ["https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-                 "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average"],
-        "dow jones 30": ["https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-                         "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average"],
+        "ftse100": [
+            "https://en.wikipedia.org/wiki/FTSE_100_Index",
+            "https://en.m.wikipedia.org/wiki/FTSE_100_Index",
+        ],
+        "ftse250": [
+            "https://en.wikipedia.org/wiki/FTSE_250_Index",
+            "https://en.m.wikipedia.org/wiki/FTSE_250_Index",
+        ],
+        "dow": [
+            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+            "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+        ],
+        "djia": [
+            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+            "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+        ],
+        "dow jones 30": [
+            "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+            "https://en.m.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+        ],
         "sp500": ["https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"],
         "s&p 500": ["https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"],
         "sp500_diva": ["https://en.wikipedia.org/wiki/S%26P_500_Dividend_Aristocrats"],
@@ -245,7 +287,7 @@ def load_index_members(name: str) -> List[str]:
     errors = []
     for url in URLS[name]:
         try:
-            html = _get_html(url)                  # <- niemals URL direkt an read_html
+            html = _get_html(url)  # via REST/Mobile/klassisch
             tables = _read_tables(html)
             if not tables:
                 raise RuntimeError("Keine Tabellen gefunden")
@@ -729,4 +771,3 @@ if run_btn and watchlist:
             st.dataframe(err_df, use_container_width=True)
 else:
     st.caption("Tipp: Bei EU/UK-Werten Yahoo-Suffixe nutzen (.DE, .L, .VI, .PA, .TO, .AX, …).")
-

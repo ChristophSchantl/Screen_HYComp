@@ -71,26 +71,24 @@ def _wiki_rest_html(url: str) -> str:
         return ""
 
 def _get_html(url: str) -> str:
-    # 1) REST-API  2) klassisch  3) mobile Fallback
     html = _wiki_rest_html(url)
     if html:
         return html
-    r = _SESSION.get(url, headers=HEADERS, timeout=25)
-    if r.status_code == 403 and "wikipedia.org" in url:
-        url_m = url.replace("://en.wikipedia.org/", "://en.m.wikipedia.org/").replace(
-            "://de.wikipedia.org/", "://de.m.wikipedia.org/"
-        )
-        r = _SESSION.get(url_m, headers=HEADERS, timeout=25)
-    if r.status_code == 403:
-        raise PermissionError(f"403 Forbidden @ {url}")
-    r.raise_for_status()
-    return r.text
 
-def _read_tables(html_text: str) -> list[pd.DataFrame]:
     try:
-        return pd.read_html(html_text, flavor="lxml")
+        r = _SESSION.get(url, headers=HEADERS, timeout=25)
+        if r.status_code == 403 and "wikipedia.org" in url:
+            url_m = url.replace("://en.wikipedia.org/", "://en.m.wikipedia.org/").replace(
+                "://de.wikipedia.org/", "://de.m.wikipedia.org/"
+            )
+            r = _SESSION.get(url_m, headers=HEADERS, timeout=25)
+        if r.status_code == 403:
+            return ""  # <— KEIN raise mehr
+        r.raise_for_status()
+        return r.text
     except Exception:
-        return pd.read_html(html_text, flavor="bs4")
+        return ""  # defensiv: auch hier nie Exception bubbles
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -231,7 +229,7 @@ def _pick_symbol_column(tbl: pd.DataFrame, prefer: list[str]) -> str | None:
 def load_index_members(name: str, prefer_offline: bool = True) -> List[str]:
     name = name.lower().strip()
 
-    # 1) Offline bevorzugen
+    # Offline zuerst (403-sicher)
     if prefer_offline and name in OFFLINE_TICKERS:
         return OFFLINE_TICKERS[name]
 
@@ -327,9 +325,9 @@ def load_index_members(name: str, prefer_offline: bool = True) -> List[str]:
             continue
 
     # 3) Offline als Rückfallebene
-    if name in OFFLINE_TICKERS:
+   if name in OFFLINE_TICKERS:
         return OFFLINE_TICKERS[name]
-    raise RuntimeError("Index-Download fehlgeschlagen. Logs:\n" + "\n".join(errors))
+    return []  # <— statt raise RuntimeError
 
 # ─────────────────────────────────────────────────────────────
 # Metrics (TTM, robust, GBX-fix)
@@ -606,39 +604,39 @@ manual_syms = [s.strip().upper() for s in manual.split(",") if s.strip()] if man
 
 st.sidebar.subheader("📚 Index hinzufügen")
 prefer_offline = st.sidebar.checkbox("Offline-Indexlisten bevorzugen (403-sicher)", value=True)
+
 index_choice = st.sidebar.selectbox(
     "Index",
-    [
-        "– auswählen –",
-        "DAX", "MDAX",
-        "FTSE 100", "FTSE 250",
-        "S&P 500",
-        "S&P 500 Div. Aristocrats",
-        "S&P 400 Div. Aristocrats",
-        "S&P/TSX 60",
-        "S&P/ASX 200",
-        "Dow Jones 30",
-    ]
+    ["– auswählen –","DAX","MDAX","FTSE 100","FTSE 250","S&P 500",
+     "S&P 500 Div. Aristocrats","S&P 400 Div. Aristocrats",
+     "S&P/TSX 60","S&P/ASX 200","Dow Jones 30"]
 )
+
 index_syms = []
 if index_choice != "– auswählen –":
+    key_map = {
+        "ftse 100": "ftse100", "ftse 250": "ftse250",
+        "dow jones 30": "dow jones 30", "s&p 500": "s&p 500",
+        "s&p 500 div. aristocrats": "sp500_diva",
+        "s&p 400 div. aristocrats": "sp400_diva",
+        "s&p/tsx 60": "tsx60", "s&p/asx 200": "asx200",
+    }
+    idx_key = key_map.get(index_choice.lower(), index_choice).lower()
     try:
-        key_map = {
-            "ftse 100": "ftse100",
-            "ftse 250": "ftse250",
-            "dow jones 30": "dow jones 30",
-            "s&p 500": "s&p 500",
-            "s&p 500 div. aristocrats": "sp500_diva",
-            "s&p 400 div. aristocrats": "sp400_diva",
-            "s&p/tsx 60": "tsx60",
-            "s&p/asx 200": "asx200",
-        }
-        idx_key = key_map.get(index_choice.lower(), index_choice)
         index_syms = load_index_members(idx_key, prefer_offline=prefer_offline)
-        src_label = "Offline-Liste" if (prefer_offline and idx_key in OFFLINE_TICKERS) else "Online (REST)"
-        st.sidebar.info(f"{index_choice}: {len(index_syms)} Werte geladen • Quelle: {src_label}")
+        if index_syms:
+            src = "Offline" if (prefer_offline and idx_key in OFFLINE_TICKERS) else "Online"
+            st.sidebar.info(f"{index_choice}: {len(index_syms)} Werte geladen • Quelle: {src}")
+        else:
+            raise RuntimeError("leere Indexliste")
     except Exception as e:
-        st.sidebar.error(f"Index-Fehler: {e}")
+        # Niemals hart fehlschlagen – letzte Rückfallebene
+        if idx_key in OFFLINE_TICKERS:
+            index_syms = OFFLINE_TICKERS[idx_key]
+            st.sidebar.warning(f"{index_choice}: Online blockiert ({e}). Offline-Liste verwendet: {len(index_syms)}")
+        else:
+            st.sidebar.error(f"{index_choice}: {e}")
+
 
 watchlist = sorted({*uploaded_syms, *manual_syms, *index_syms})
 st.sidebar.caption(f"Gesamt-Watchlist: **{len(watchlist)}** Ticker")

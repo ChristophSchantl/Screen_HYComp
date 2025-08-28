@@ -616,7 +616,7 @@ if run_btn and watchlist:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("BUY", int(counts.get("BUY", 0)))
         c2.metric("ACCUMULATE/WATCH", int(counts.get("ACCUMULATE/WATCH", 0)))
-        c3.metric("AVOID/HOLD", int(counts.get("AVOID/HOLD, 0)))
+        c3.metric("AVOID/HOLD", int(counts.get("AVOID/HOLD", 0)))  # ← fix: korrektes Quote
         c4.metric("Total", len(df))
 
         prefer_cols = [
@@ -648,7 +648,7 @@ if run_btn and watchlist:
         from io import BytesIO
         ts = pd.Timestamp.now(tz="Europe/Zurich").strftime("%Y-%m-%d_%H%M")
 
-        c_us, c_eu, c_xlsx = st.columns(3)
+        c_us, c_eu, c_xlsx = st.columns(3)  # drei Spalten erzeugen
 
         csv_us = df.to_csv(index=False).encode("utf-8")
         csv_eu = df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")  # EU: ; und Komma

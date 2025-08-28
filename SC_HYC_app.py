@@ -4,7 +4,7 @@
 from __future__ import annotations
 import time
 from typing import Dict, List, Iterable
-from io import BytesIO  # am Anfang der Datei ODER direkt hier importieren
+from io import BytesIO 
 
 import numpy as np
 import pandas as pd
@@ -590,6 +590,7 @@ st.sidebar.caption(f"Gewichtssumme: **{sum(weights.values()):.2f}**")
 
 run_btn = st.sidebar.button("🔎 Score berechnen", use_container_width=True)
 
+
 # ─────────────────────────────────────────────────────────────
 # Main – Output
 # ─────────────────────────────────────────────────────────────
@@ -615,7 +616,7 @@ if run_btn and watchlist:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("BUY", int(counts.get("BUY", 0)))
         c2.metric("ACCUMULATE/WATCH", int(counts.get("ACCUMULATE/WATCH", 0)))
-        c3.metric("AVOID/HOLD", int(counts.get("AVOID/HOLD", 0)))
+        c3.metric("AVOID/HOLD", int(counts.get("AVOID/HOLD, 0)))
         c4.metric("Total", len(df))
 
         prefer_cols = [
@@ -643,31 +644,61 @@ if run_btn and watchlist:
             },
         )
 
-        c_us, c_eu, c_xlsx = st.columns(2)
+        # ── Exporte (US-CSV, EU-CSV, Excel)
+        from io import BytesIO
+        ts = pd.Timestamp.now(tz="Europe/Zurich").strftime("%Y-%m-%d_%H%M")
+
+        c_us, c_eu, c_xlsx = st.columns(3)
+
+        csv_us = df.to_csv(index=False).encode("utf-8")
+        csv_eu = df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")  # EU: ; und Komma
 
         with c_us:
             st.download_button(
                 "⬇️ CSV (US, , .)",
-                data=df.to_csv(index=False).encode("utf-8"),
-                file_name="high_yield_scores.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        
-        with c_eu:
-            st.download_button(
-                "⬇️ CSV (EU, ; , ,)",
-                data=df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
-                file_name="high_yield_scores_eu.csv",
+                data=csv_us,
+                file_name=f"high_yield_scores_{ts}.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
 
+        with c_eu:
+            st.download_button(
+                "⬇️ CSV (EU, ; , ,)",
+                data=csv_eu,
+                file_name=f"high_yield_scores_{ts}_eu.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        with c_xlsx:
+            try:
+                buf = BytesIO()
+                df.to_excel(buf, index=False, sheet_name="Scores")
+                buf.seek(0)
+                st.download_button(
+                    "⬇️ Excel (.xlsx)",
+                    data=buf.getvalue(),
+                    file_name=f"high_yield_scores_{ts}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.warning(f"Excel-Export vorübergehend deaktiviert: {e}")
+                st.download_button(
+                    "⬇️ CSV (EU, Fallback)",
+                    data=csv_eu,
+                    file_name=f"high_yield_scores_{ts}_eu.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+        # ── Fehler-/Hinweis-Tabelle
         err_df = df[df["error"].notna()][["ticker","error"]]
         if not err_df.empty:
             st.warning("Hinweise/Fehler beim Laden einiger Ticker:")
             st.dataframe(err_df, use_container_width=True)
+    else:
+        st.info("Keine verwertbaren Ergebnisse für aktuelle Filter.")
 else:
     st.caption("Tipp: Bei EU/UK-Werten Yahoo-Suffixe nutzen (.DE, .L, .VI, .PA, .TO, .AX, …).")
-
-

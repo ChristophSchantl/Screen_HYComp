@@ -4,6 +4,7 @@
 from __future__ import annotations
 import time
 from typing import Dict, List, Iterable
+from io import BytesIO  # am Anfang der Datei ODER direkt hier importieren
 
 import numpy as np
 import pandas as pd
@@ -642,13 +643,25 @@ if run_btn and watchlist:
             },
         )
 
-        st.download_button(
-            "⬇️ Ergebnisse als CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name="high_yield_scores.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        c_us, c_eu, c_xlsx = st.columns(2)
+
+        with c_us:
+            st.download_button(
+                "⬇️ CSV (US, , .)",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name="high_yield_scores.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        
+        with c_eu:
+            st.download_button(
+                "⬇️ CSV (EU, ; , ,)",
+                data=df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+                file_name="high_yield_scores_eu.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
         err_df = df[df["error"].notna()][["ticker","error"]]
         if not err_df.empty:

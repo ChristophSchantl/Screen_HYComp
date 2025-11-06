@@ -14,8 +14,8 @@ import yfinance as yf
 # ─────────────────────────────────────────────────────────────
 # Seite
 # ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="High-Yield Dividend Scoring", layout="wide")
-st.title("📈 High-Yield Dividend Scoring")
+st.set_page_config(page_title="Contrarian Value Scoring Model", layout="wide")
+st.title("📈 Contrarian Value Scoring Model")
 st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • robuste Datenlogik")
 
 # ─────────────────────────────────────────────────────────────

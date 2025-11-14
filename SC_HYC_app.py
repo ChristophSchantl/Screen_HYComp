@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 
 st.set_page_config(page_title="Master Scoring Model (Simplified • Pro)", layout="wide")
-st.title("📈 Master Scoring Model – Simplified")
+st.title("📈 Master Scoring Model")
 st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • 52W nur aus History • schlankes Faktor-Set")
 
 # ─────────────────────────────────────────────────────────────

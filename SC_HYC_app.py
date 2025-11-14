@@ -1,8 +1,7 @@
 # app.py
-# High-Yield Dividend Scoring – Streamlit (ohne Wikipedia-Index, mit editierbaren Gewichten & Scoring-Parametern)
+# High-Yield Dividend Scoring – Streamlit (ohne Wikipedia-Index, parametrisierbar)
 
 from __future__ import annotations
-import time
 from typing import Dict, List, Iterable
 from io import BytesIO
 
@@ -101,7 +100,6 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 # Kurs-Historie
 # ─────────────────────────────────────────────────────────────
 def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
-    """Immer Close per history() liefern."""
     try:
         h = t.history(period=period, interval=interval, auto_adjust=True)
         if isinstance(h, pd.DataFrame) and "Close" in h.columns:
@@ -352,7 +350,7 @@ def run_scoring(
     if not tickers:
         return pd.DataFrame(columns=EXPECTED_COLS)
 
-    rows, errors = [], []
+    rows = []
     pbar = st.progress(0.0, text="Kennzahlen: 0/0")
     total = len(tickers)
     done = 0
@@ -364,7 +362,6 @@ def run_scoring(
             try:
                 rows.append(fut.result())
             except Exception as e:
-                errors.append((tk, str(e)))
                 rows.append({"ticker": tk, "error": str(e)})
             done += 1
             pbar.progress(done / total, text=f"Kennzahlen: {done}/{total}")
@@ -424,7 +421,7 @@ watchlist = sorted({*uploaded_syms, *manual_syms})
 st.sidebar.caption(f"Gesamt-Watchlist: **{len(watchlist)}** Ticker")
 
 # ─────────────────────────────────────────────────────────────
-# Sidebar – Filter & editierbare Gewichte
+# Sidebar – Filter & Gewichte
 # ─────────────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Filter & Optionen")
 min_yield = st.sidebar.number_input("Min. Dividendenrendite", min_value=0.0, max_value=0.3, value=0.00, step=0.005, format="%.3f")
@@ -443,7 +440,7 @@ with c_reset:
     if st.button("↩️ Standard", use_container_width=True):
         st.session_state.weights = DEFAULT_WEIGHTS.copy()
 with c_norm:
-    auto_norm = st.checkbox("Normieren", value=True, help="Skaliert die Gewichte so, dass die Summe 1.0 ergibt")
+    auto_norm = st.checkbox("Normieren", value=True, help="Summe der Gewichte = 1.0")
 
 label_map = {
     "sc_yield": "Yield",
@@ -467,11 +464,7 @@ for k, default in DEFAULT_WEIGHTS.items():
     )
 
 total_w = sum(tmp_weights.values())
-if auto_norm and total_w > 0:
-    weights = {k: v / total_w for k, v in tmp_weights.items()}
-else:
-    weights = tmp_weights
-
+weights = {k: v / total_w for k, v in tmp_weights.items()} if (auto_norm and total_w > 0) else tmp_weights
 st.session_state.weights = tmp_weights
 st.sidebar.caption(f"Gewichtssumme: **{sum(weights.values()):.2f}**")
 
@@ -486,10 +479,27 @@ y_scale = st.sidebar.number_input("Yield-Scale (0..1)", 0.001, 0.5, value=SCORIN
 invert_52w = st.sidebar.checkbox("52W invertieren (nah am Low = besser)", value=SCORING_DEFAULTS["invert_52w"])
 pos_gamma  = st.sidebar.slider("52W-Gamma (Nichtlinearität)", 0.3, 3.0, value=float(SCORING_DEFAULTS["pos_52w_gamma"]), step=0.1)
 
-beta_lo, beta_m1, beta_m2, beta_hi = st.sidebar.slider(
-    "Beta-Knoten (lo, m1, m2, hi)", 0.0, 3.0, value=tuple(SCORING_DEFAULTS["beta_knots"]))
-score_lo, score_m1, score_m2, score_hi = st.sidebar.slider(
-    "Beta-Scores (Punkte an Knoten)", 0.0, 100.0, value=tuple(SCORING_DEFAULTS["beta_scores"]))
+# ---- FIX: Vier einzelne Inputs für Beta-Knoten und -Scores
+c1, c2, c3, c4 = st.sidebar.columns(4)
+beta_lo = c1.number_input("β lo", 0.0, 3.0, value=float(SCORING_DEFAULTS["beta_knots"][0]), step=0.05, key="beta_lo")
+beta_m1 = c2.number_input("β m1", 0.0, 3.0, value=float(SCORING_DEFAULTS["beta_knots"][1]), step=0.05, key="beta_m1")
+beta_m2 = c3.number_input("β m2", 0.0, 3.0, value=float(SCORING_DEFAULTS["beta_knots"][2]), step=0.05, key="beta_m2")
+beta_hi = c4.number_input("β hi", 0.0, 3.0, value=float(SCORING_DEFAULTS["beta_knots"][3]), step=0.05, key="beta_hi")
+
+d1, d2, d3, d4 = st.sidebar.columns(4)
+score_lo = d1.number_input("Pts lo", 0.0, 100.0, value=float(SCORING_DEFAULTS["beta_scores"][0]), step=1.0, key="score_lo")
+score_m1 = d2.number_input("Pts m1", 0.0, 100.0, value=float(SCORING_DEFAULTS["beta_scores"][1]), step=1.0, key="score_m1")
+score_m2 = d3.number_input("Pts m2", 0.0, 100.0, value=float(SCORING_DEFAULTS["beta_scores"][2]), step=1.0, key="score_m2")
+score_hi = d4.number_input("Pts hi", 0.0, 100.0, value=float(SCORING_DEFAULTS["beta_scores"][3]), step=1.0, key="score_hi")
+
+# Monotonie absichern
+knots = [beta_lo, beta_m1, beta_m2, beta_hi]
+scores = [score_lo, score_m1, score_m2, score_hi]
+if any(np.diff(knots) < 0):
+    order = np.argsort(knots)
+    knots  = [knots[i]  for i in order]
+    scores = [scores[i] for i in order]
+    st.sidebar.info("β-Knoten wurden aufsteigend sortiert.")
 
 de_thr = st.sidebar.number_input("D/E-Schwelle für Strafe", 0.0, 10.0, value=SCORING_DEFAULTS["de_threshold"], step=0.1)
 de_pen = st.sidebar.number_input("Strafe bei hohem D/E", 0.0, 50.0, value=SCORING_DEFAULTS["high_de_penalty"], step=1.0)
@@ -502,8 +512,7 @@ cap_cov = st.sidebar.number_input("Cap bei schwacher Coverage (max Score)", 0.0,
 params = {
     "yield_floor": y_floor, "yield_scale": y_scale,
     "invert_52w": invert_52w, "pos_52w_gamma": pos_gamma,
-    "beta_knots": [beta_lo, beta_m1, beta_m2, beta_hi],
-    "beta_scores": [score_lo, score_m1, score_m2, score_hi],
+    "beta_knots": knots, "beta_scores": scores,
     "de_threshold": de_thr, "high_de_penalty": de_pen,
     "beta_threshold": beta_thr, "high_beta_penalty": beta_pen,
     "cap_max_after_cut": cap_cut, "cap_max_after_cov": cap_cov,
@@ -568,7 +577,6 @@ if run_btn and watchlist:
         # Exporte
         ts = pd.Timestamp.now(tz="Europe/Vienna").strftime("%Y-%m-%d_%H%M")
         c_us, c_eu, c_xlsx = st.columns(3)
-
         csv_us = df.to_csv(index=False).encode("utf-8")
         csv_eu = df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
 

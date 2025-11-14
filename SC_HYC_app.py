@@ -1,707 +1,379 @@
-# app.py
-# High-Yield Dividend Scoring – Streamlit (editierbare Gewichte, bessere Index-Auswahl)
-
+# app.py — Master Scoring Model (Streamlit • Pro)
 from __future__ import annotations
-import time
-from typing import Dict, List, Iterable
-from io import BytesIO 
+import numpy as np, pandas as pd, streamlit as st, yfinance as yf
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
 
-import numpy as np
-import pandas as pd
-import streamlit as st
-import yfinance as yf
-
-# ─────────────────────────────────────────────────────────────
-# Seite
-# ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Contrarian Value Scoring Model", layout="wide")
-st.title("📈 Contrarian Value Scoring Model")
-st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • robuste Datenlogik")
+st.set_page_config(page_title="Master Scoring Model (Pro)", layout="wide")
+st.title("📈 Master Scoring Model (Pro)")
+st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • robuste Datenlogik • PM-Summary")
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
-def _row(df: pd.DataFrame, keys: List[str]) -> pd.Series:
-    for k in keys:
-        if isinstance(df, pd.DataFrame) and k in df.index:
-            s = df.loc[k].dropna().astype(float)
-            if len(s):
-                return s
-    return pd.Series(dtype=float)
-
-def _ttm_sum(q_df: pd.DataFrame, keys: List[str], n: int = 4) -> float:
-    s = _row(q_df, keys)
-    return float(s.iloc[:n].sum()) if len(s) else np.nan
-
-def _percentile_rank(s: pd.Series) -> pd.Series:
-    m = s.notna()
-    out = pd.Series(np.nan, index=s.index)
-    if m.sum() <= 1:
-        out[m] = 0.5
-        return out
-    out[m] = s[m].rank(pct=True)
-    return out
-
-def _sector_percentile(df: pd.DataFrame, col: str, invert: bool = False) -> pd.Series:
-    work = df.copy()
-    work["sector"] = work.get("sector", pd.Series(index=work.index, dtype="object")).fillna("Unknown")
-    p = work.groupby("sector", dropna=False, group_keys=False)[col].apply(_percentile_rank)
-    if invert:
-        p = 1 - p
-    return (p * 100).clip(0, 100)
-
-def _map_beta(b: float) -> float:
-    # 0.4→100, 0.8→70, 1.0→50, 1.5→0
-    return float(np.interp(b, [0.4, 0.8, 1.0, 1.5], [100, 70, 50, 0], left=100, right=0))
-
-def _is_num(x) -> bool:
-    try:
-        f = float(x)
-        return np.isfinite(f)
-    except Exception:
-        return False
-
-def _to_float(x) -> float:
+def _to_float(x):
     try:
         f = float(x)
         return f if np.isfinite(f) else np.nan
     except Exception:
         return np.nan
 
-def _clean_symbols(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.upper().str.strip().str.replace(r"[^A-Z0-9\.\-]", "", regex=True)
+def _row(df: pd.DataFrame, keys):
+    for k in keys:
+        if isinstance(df, pd.DataFrame) and k in df.index:
+            s = df.loc[k].dropna().astype(float)
+            if len(s): return s
+    return pd.Series(dtype=float)
 
-def _apply_suffix(symbols: List[str], suffix: str) -> List[str]:
-    out = []
-    for s in symbols:
-        if not s:
-            continue
-        out.append(s if "." in s else s + suffix)
-    return out
+def _ttm_sum(q_df: pd.DataFrame, keys, n=4):
+    s = _row(q_df, keys)
+    return float(s.iloc[:n].sum()) if len(s) else np.nan
 
-def _safe_info(t: yf.Ticker) -> Dict:
+def _percentile_rank(s: pd.Series) -> pd.Series:
+    m = s.notna()
+    if m.sum() <= 1:
+        out = pd.Series(np.nan, index=s.index)
+        out[m] = 0.5
+        return out
+    return s.rank(pct=True)
+
+def _sector_percentile(df: pd.DataFrame, col: str, invert: bool = False) -> pd.Series:
+    work = df.copy()
+    work["sector"] = work.get("sector", pd.Series(index=work.index, dtype="object")).fillna("Unknown")
+    p = work.groupby("sector", dropna=False, group_keys=False)[col].apply(_percentile_rank)
+    if invert: p = 1 - p
+    return (p * 100).clip(0, 100)
+
+def _hist_close(ticker: str, period="5y", interval="1d") -> pd.Series:
     try:
-        return t.get_info()
-    except Exception:
-        return getattr(t, "info", {}) or {}
-
-def _safe_fast(t: yf.Ticker) -> Dict:
-    return getattr(t, "fast_info", {}) or {}
-
-# ─────────────────────────────────────────────────────────────
-# Erwartete Spalten
-# ─────────────────────────────────────────────────────────────
-EXPECTED_COLS = [
-    "ticker","sector","price","div_yield_ttm","yield_5y_median",
-    "low_52w","high_52w","pos_52w",
-    "pe_ttm","ev_ebitda_ttm","de_ratio",
-    "fcf_ttm","fcf_margin_ttm","ebitda_ttm","ebitda_margin_ttm",
-    "beta_2y_w","market_cap","adv_3m",
-    "div_cash_ttm","coverage_fcf_ttm","fcf_payout_ttm",
-    "div_cut_24m","error"
-]
-def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    for c in EXPECTED_COLS:
-        if c not in df.columns:
-            df[c] = np.nan
-    return df
-
-# ─────────────────────────────────────────────────────────────
-# Kurs-Historie
-# ─────────────────────────────────────────────────────────────
-def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
-    """Immer Close per history() liefern."""
+        h = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+        if "Close" in h: return h["Close"].dropna()
+    except Exception: pass
     try:
-        h = t.history(period=period, interval=interval, auto_adjust=True)
-        if isinstance(h, pd.DataFrame) and "Close" in h.columns:
-            return h["Close"].dropna()
-    except Exception:
-        pass
+        h = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
+        if "Close" in h: return h["Close"].dropna()
+    except Exception: pass
     return pd.Series(dtype=float)
 
 # ─────────────────────────────────────────────────────────────
-# Index-Mitglieder (Wikipedia)
-# ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=60*60*12)
-def load_index_members(name: str) -> List[str]:
-    name = name.lower().strip()
-
-    if name in {"dax", "dax40"}:
-        url = "https://en.wikipedia.org/wiki/DAX"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("ticker" in str(c).lower() or "symbol" in str(c).lower()
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("DAX constituents not found")
-        col = next(c for c in tbl.columns if "ticker" in str(c).lower() or "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".DE")
-
-    if name in {"mdax"}:
-        url = "https://en.wikipedia.org/wiki/MDAX"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("ticker" in str(c).lower() or "symbol" in str(c).lower()
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("MDAX constituents not found")
-        col = next(c for c in tbl.columns if "ticker" in str(c).lower() or "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".DE")
-
-    if name in {"ftse100", "ftse 100", "ftse 100 index"}:
-        url = "https://en.wikipedia.org/wiki/FTSE_100_Index"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any(("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower())
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("FTSE 100 constituents not found")
-        col = next(c for c in tbl.columns if ("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower()))
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".L")
-
-    if name in {"ftse250", "ftse 250"}:
-        url = "https://en.wikipedia.org/wiki/FTSE_250_Index"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any(("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower())
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("FTSE 250 constituents not found")
-        col = next(c for c in tbl.columns if ("epic" in str(c).lower()) or ("ticker" in str(c).lower()) or ("symbol" in str(c).lower()))
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".L")
-
-    if name in {"dow", "djia", "dow jones 30", "dow jones"}:
-        url = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("Dow 30 constituents not found")
-        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)  # BRK.B -> BRK-B
-        return syms.tolist()
-
-    if name in {"sp500", "s&p500", "s&p 500", "s&p", "s and p 500"}:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("S&P 500 constituents not found")
-        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)
-        return syms.tolist()
-
-    if name in {"sp500_diva", "s&p 500 dividend aristocrats"}:
-        url = "https://en.wikipedia.org/wiki/S%26P_500_Dividend_Aristocrats"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("S&P 500 Dividend Aristocrats not found")
-        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)
-        return syms.tolist()
-
-    if name in {"sp400_diva", "s&p 400 dividend aristocrats"}:
-        url = "https://en.wikipedia.org/wiki/S%26P_400_Dividend_Aristocrats"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any("symbol" in str(c).lower() for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("S&P 400 Dividend Aristocrats not found")
-        col = next(c for c in tbl.columns if "symbol" in str(c).lower())
-        syms = _clean_symbols(tbl[col]).str.replace(".", "-", regex=False)
-        return syms.tolist()
-
-    if name in {"tsx60", "s&p/tsx 60"}:
-        url = "https://en.wikipedia.org/wiki/S%26P/TSX_60"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any(("symbol" in str(c).lower()) or ("ticker" in str(c).lower())
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("S&P/TSX 60 constituents not found")
-        col = next(c for c in tbl.columns if ("symbol" in str(c).lower()) or ("ticker" in str(c).lower()))
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".TO")
-
-    if name in {"asx200", "s&p/asx 200"}:
-        url = "https://en.wikipedia.org/wiki/S%26P/ASX_200"
-        tables = pd.read_html(url, flavor="lxml")
-        tbl = next((tb for tb in tables if any(("code" in str(c).lower()) or ("symbol" in str(c).lower())
-                                               for c in tb.columns)), None)
-        if tbl is None: raise RuntimeError("S&P/ASX 200 constituents not found")
-        col = next(c for c in tbl.columns if ("code" in str(c).lower()) or ("symbol" in str(c).lower()))
-        syms = _clean_symbols(tbl[col])
-        return _apply_suffix(syms.tolist(), ".AX")
-
-    raise ValueError(f"Unbekannter Index: {name}")
-
-# ─────────────────────────────────────────────────────────────
-# Metrics (TTM, robust, GBX-fix)
+# Metrics (robust; 52W nur aus History)
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60*30)
-def metrics_for(ticker: str) -> Dict:
-    t = yf.Ticker(ticker)
+def fetch_metrics(tk: str) -> dict:
+    t = yf.Ticker(tk)
     try:
-        info = _safe_info(t)
-        fast = _safe_fast(t)
-        currency = (fast.get("currency") or info.get("currency") or "").upper()
-        is_gbx = currency in {"GBX", "GBp"} or (ticker.endswith(".L") and currency in {"", None})
-
-        px = _hist_close(t, period="5y", interval="1d")
-        if px.empty:
-            try:
-                px = yf.download(ticker, period="5y", interval="1d", auto_adjust=True, progress=False)["Close"].dropna()
-            except Exception:
-                px = pd.Series(dtype=float)
-        if px.empty:
-            raise RuntimeError("No price history")
-
-        price_fast = _to_float(fast.get("last_price"))
-        price = price_fast if np.isfinite(price_fast) and price_fast > 0 else float(px.iloc[-1])
-
-        low_52w = fast.get("year_low"); high_52w = fast.get("year_high")
-        if not (_is_num(low_52w) and _is_num(high_52w)):
-            px1y = _hist_close(t, period="1y", interval="1d")
-            if px1y.empty:
-                px1y = px.tail(252)
-            low_52w, high_52w = float(px1y.min()), float(px1y.max())
-        else:
-            low_52w, high_52w = float(low_52w), float(high_52w)
-
-        if is_gbx:
-            price *= 0.01
-            low_52w *= 0.01
-            high_52w *= 0.01
-            px = px * 0.01
-
-        rng = high_52w - low_52w
-        pos_52w = (price - low_52w) / (rng if _is_num(rng) and rng > 0 else np.nan)
-
         try:
-            div = t.get_dividends()
+            info = t.get_info()
         except Exception:
-            div = getattr(t, "dividends", pd.Series(dtype=float))
-        if is_gbx and isinstance(div, pd.Series) and len(div):
-            div = div * 0.01
+            info = getattr(t, "info", {}) or {}
 
-        if isinstance(div, pd.Series) and len(div):
-            div_ttm = float(div[div.index >= (div.index.max() - pd.Timedelta(days=365))].sum())
-        else:
-            div_ttm = 0.0
-        div_yield_ttm = (div_ttm / float(price)) if price and price > 0 else np.nan
+        px = _hist_close(tk, "5y", "1d")
+        if px.empty: raise RuntimeError("no_price_history")
+        price = float(px.iloc[-1])
 
+        # 52W aus ADJUSTED history
+        px1y = _hist_close(tk, "1y", "1d")
+        if px1y.empty: px1y = px.tail(252)
+        low_52w  = float(px1y.min())
+        high_52w = float(px1y.max())
+        rng = high_52w - low_52w
+        pos_52w = (price - low_52w) / (rng if rng > 0 else np.nan)
+
+        # Dividenden
+        try: div = t.get_dividends()
+        except Exception: div = getattr(t, "dividends", pd.Series(dtype=float))
         pm = px.resample("M").last()
-        dm = div.resample("M").sum().reindex(pm.index, fill_value=0.0) if isinstance(div, pd.Series) and len(div) else pd.Series(0.0, index=pm.index)
+        dm = div.resample("M").sum().reindex(pm.index, fill_value=0.0) if isinstance(div, pd.Series) else pd.Series(0.0, index=pm.index)
         ttm_div_m = dm.rolling(12, min_periods=1).sum()
-        yld_m = (ttm_div_m / pm).dropna()
-        if len(yld_m):
-            months = min(60, len(yld_m))
-            start = yld_m.index.max() - pd.DateOffset(months=months)
-            yld_5y_med = float(yld_m.loc[yld_m.index >= start].median())
-        else:
-            yld_5y_med = np.nan
+        yld_ttm  = float(ttm_div_m.iloc[-1] / price) if price > 0 else np.nan
+        yld_med5 = float((ttm_div_m / pm).tail(min(60, len(pm))).median()) if len(pm) else np.nan
 
-        div_ttm_current = float(ttm_div_m.iloc[-1]) if len(ttm_div_m) else 0.0
-        div_ttm_prev = float(ttm_div_m.shift(12).iloc[-1]) if len(ttm_div_m) > 12 else np.nan
-        div_cut_24m = int(np.isfinite(div_ttm_prev) and div_ttm_prev > 0 and (div_ttm_current < 0.9 * div_ttm_prev))
-
+        # Quarterlies
         q_is = t.quarterly_financials if hasattr(t, "quarterly_financials") else pd.DataFrame()
         q_bs = t.quarterly_balance_sheet if hasattr(t, "quarterly_balance_sheet") else pd.DataFrame()
         q_cf = t.quarterly_cashflow if hasattr(t, "quarterly_cashflow") else pd.DataFrame()
 
-        revenue = _ttm_sum(q_is, ["Total Revenue","Revenue"])
-        ebitda  = _ttm_sum(q_is, ["EBITDA","Ebitda"])
-        op_cf   = _ttm_sum(q_cf, ["Total Cash From Operating Activities","Operating Cash Flow"])
-        capex_y = _ttm_sum(q_cf, ["Capital Expenditures","Capital Expenditure"])
-        capex   = -capex_y if np.isfinite(capex_y) else np.nan
-        fcf     = op_cf - capex if np.isfinite(op_cf) and np.isfinite(capex) else np.nan
+        revenue=_ttm_sum(q_is,["Total Revenue","Revenue"])
+        ebitda =_ttm_sum(q_is,["EBITDA","Ebitda"])
+        op_cf  =_ttm_sum(q_cf,["Total Cash From Operating Activities","Operating Cash Flow"])
+        capex_y=_ttm_sum(q_cf,["Capital Expenditures","Capital Expenditure"])
+        capex  = -capex_y if np.isfinite(capex_y) else np.nan
+        fcf    = op_cf - capex if np.isfinite(op_cf) and np.isfinite(capex) else np.nan
 
-        div_paid_cf = _ttm_sum(q_cf, ["Dividends Paid"])
-        div_cash_ttm = abs(div_paid_cf) if np.isfinite(div_paid_cf) else div_ttm_current
+        ebitda_margin = (ebitda/revenue) if (np.isfinite(ebitda) and np.isfinite(revenue) and revenue>0) else np.nan
+        fcf_margin    = (fcf/revenue) if (np.isfinite(fcf) and np.isfinite(revenue) and revenue>0) else np.nan
 
-        equity = _ttm_sum(q_bs, ["Total Stockholder Equity","Total Equity Gross Minority Interest"])
-        total_debt_cf = _ttm_sum(q_bs, ["Long Term Debt"]) + _ttm_sum(q_bs, ["Short Long Term Debt","Short Term Debt"])
-        total_debt_cf = total_debt_cf if np.isfinite(total_debt_cf) else np.nan
+        equity=_ttm_sum(q_bs,["Total Stockholder Equity","Total Equity Gross Minority Interest"])
+        total_debt = _ttm_sum(q_bs,["Long Term Debt"]) + _ttm_sum(q_bs,["Short Long Term Debt","Short Term Debt"])
+        de_ratio = (total_debt/equity) if (np.isfinite(total_debt) and np.isfinite(equity) and equity>0) else np.nan
 
-        sector = (info.get("sector") or "Unknown")
-        mcap = _to_float(info.get("marketCap", fast.get("market_cap")))
-        adv3 = _to_float(info.get("averageDailyVolume3Month", fast.get("three_month_average_volume")))
-
-        total_debt = _to_float(info.get("totalDebt", total_debt_cf))
-        cash = _to_float(info.get("totalCash", np.nan))
-
-        de_ratio = (total_debt / equity) if (np.isfinite(total_debt) and np.isfinite(equity) and equity > 0) else np.nan
-        pe_ttm = _to_float(info.get("trailingPE", np.nan))
-
-        ev_num = (mcap if np.isfinite(mcap) else np.nan)
-        if np.isfinite(ev_num):
-            ev_num += (total_debt if np.isfinite(total_debt) else 0) - (cash if np.isfinite(cash) else 0)
-        ev_ebitda = (ev_num / ebitda) if (np.isfinite(ev_num) and np.isfinite(ebitda) and ebitda > 0) else np.nan
-
-        fcf_margin = (fcf / revenue) if (np.isfinite(fcf) and np.isfinite(revenue) and revenue > 0) else np.nan
-        ebitda_margin = (ebitda / revenue) if (np.isfinite(ebitda) and np.isfinite(revenue) and revenue > 0) else np.nan
-
+        # Beta (2y w)
         try:
             spx = yf.Ticker("^GSPC").history(period="2y", interval="1wk", auto_adjust=True)["Close"].pct_change().dropna()
             stw = t.history(period="2y", interval="1wk", auto_adjust=True)["Close"].pct_change().dropna()
             bdf = pd.concat([stw, spx], axis=1).dropna()
-            beta = float(np.polyfit(bdf.iloc[:,1].values, bdf.iloc[:,0].values, 1)[0]) if len(bdf) > 10 else np.nan
+            beta = float(np.polyfit(bdf.iloc[:,1].values, bdf.iloc[:,0].values, 1)[0]) if len(bdf)>10 else np.nan
         except Exception:
             beta = np.nan
 
-        coverage_fcf = (fcf / div_cash_ttm) if (np.isfinite(fcf) and div_cash_ttm > 0) else np.inf
-        fcf_payout   = (div_cash_ttm / fcf) if (np.isfinite(fcf) and fcf > 0) else np.inf
+        # EV/EBITDA, Meta
+        mcap=_to_float(info.get("marketCap"))
+        pe  =_to_float(info.get("trailingPE"))
+        cash=_to_float(info.get("totalCash")); debt=_to_float(info.get("totalDebt"))
+        ev = mcap if np.isfinite(mcap) else np.nan
+        if np.isfinite(ev): ev += (debt if np.isfinite(debt) else 0) - (cash if np.isfinite(cash) else 0)
+        ev_ebitda = (ev/ebitda) if (np.isfinite(ev) and np.isfinite(ebitda) and ebitda>0) else np.nan
 
-        err = np.nan
-        if np.isfinite(div_yield_ttm) and div_yield_ttm > 0.25:
-            err = "yield_outlier_check_currency"
+        # Div-Qualität
+        div_paid = _ttm_sum(q_cf,["Dividends Paid"])
+        div_cash_ttm = abs(div_paid) if np.isfinite(div_paid) else float(ttm_div_m.iloc[-1] if len(ttm_div_m) else 0.0)
+        coverage_fcf = (fcf/div_cash_ttm) if (np.isfinite(fcf) and div_cash_ttm>0) else np.inf
+        fcf_payout   = (div_cash_ttm/fcf) if (np.isfinite(fcf) and fcf>0) else np.inf
+        prev = float(ttm_div_m.shift(12).iloc[-1]) if len(ttm_div_m)>12 else np.nan
+        div_cut = int(np.isfinite(prev) and prev>0 and (float(ttm_div_m.iloc[-1]) < 0.9*prev))
 
-        return {
-            "ticker": ticker, "sector": sector, "price": float(price),
-            "div_yield_ttm": float(div_yield_ttm),
-            "yield_5y_median": float(yld_5y_med) if np.isfinite(yld_5y_med) else np.nan,
-            "low_52w": float(low_52w), "high_52w": float(high_52w),
-            "pos_52w": float(pos_52w) if np.isfinite(pos_52w) else np.nan,
-            "pe_ttm": float(pe_ttm) if np.isfinite(pe_ttm) else np.nan,
-            "ev_ebitda_ttm": float(ev_ebitda) if np.isfinite(ev_ebitda) else np.nan,
-            "de_ratio": float(de_ratio) if np.isfinite(de_ratio) else np.nan,
-            "fcf_ttm": float(fcf) if np.isfinite(fcf) else np.nan,
-            "fcf_margin_ttm": float(fcf_margin) if np.isfinite(fcf_margin) else np.nan,
-            "ebitda_ttm": float(ebitda) if np.isfinite(ebitda) else np.nan,
-            "ebitda_margin_ttm": float(ebitda_margin) if np.isfinite(ebitda_margin) else np.nan,
-            "beta_2y_w": float(beta) if np.isfinite(beta) else np.nan,
-            "market_cap": float(mcap) if np.isfinite(mcap) else np.nan,
-            "adv_3m": float(adv3) if np.isfinite(adv3) else np.nan,
-            "div_cash_ttm": float(div_cash_ttm) if np.isfinite(div_cash_ttm) else np.nan,
-            "coverage_fcf_ttm": float(coverage_fcf) if np.isfinite(coverage_fcf) else np.nan,
-            "fcf_payout_ttm": float(fcf_payout) if np.isfinite(fcf_payout) else np.nan,
-            "div_cut_24m": int(div_cut_24m), "error": err
-        }
+        sector = (info.get("sector") or "Unknown")
+        adv3   = _to_float(info.get("averageDailyVolume3Month"))
+
+        return dict(ticker=tk, sector=sector, price=price,
+            low_52w=low_52w, high_52w=high_52w, pos_52w=pos_52w,
+            div_yield_ttm=yld_ttm, yield_5y_median=yld_med5,
+            pe_ttm=pe, ev_ebitda_ttm=ev_ebitda, de_ratio=de_ratio,
+            fcf_margin_ttm=fcf_margin, ebitda_margin_ttm=ebitda_margin,
+            beta_2y_w=beta, market_cap=mcap, adv_3m=adv3,
+            div_cash_ttm=div_cash_ttm, coverage_fcf_ttm=coverage_fcf, fcf_payout_ttm=fcf_payout,
+            div_cut_24m=div_cut, error=np.nan)
     except Exception as e:
-        return {"ticker": ticker, "error": str(e)}
+        return {"ticker": tk, "error": str(e)}
 
 # ─────────────────────────────────────────────────────────────
-# Scoring (editierbare Gewichte)
+# Scoring
 # ─────────────────────────────────────────────────────────────
-DEFAULT_WEIGHTS: Dict[str, float] = {
-    "sc_yield": 0.22, "sc_52w": 0.18, "sc_pe": 0.12, "sc_ev_ebitda": 0.12,
-    "sc_de": 0.12, "sc_fcfm": 0.08, "sc_ebitdam": 0.06, "sc_beta": 0.06, "sc_ygap": 0.04,
-}
+FACTORS = ["sc_yield","sc_52w","sc_pe","sc_ev_ebitda","sc_de","sc_fcfm","sc_ebitdam","sc_beta","sc_ygap"]
+DEFAULT_W = {"sc_yield":0.25,"sc_52w":0.22,"sc_pe":0.12,"sc_ev_ebitda":0.12,"sc_de":0.12,"sc_fcfm":0.07,"sc_ebitdam":0.04,"sc_beta":0.04,"sc_ygap":0.02}
 
-def build_scores(df: pd.DataFrame, weights: Dict[str, float] | None = None) -> pd.DataFrame:
-    wdict = weights or DEFAULT_WEIGHTS
+PARAMS_DEF = dict(
+    yield_floor=0.04, yield_scale=0.04,
+    invert_52w=True, pos_52w_gamma=1.5,
+    beta_knots=[0.30,0.80,1.00,1.60], beta_scores=[100,75,55,10],
+    de_threshold=2.0, high_de_penalty=20.0,
+    beta_threshold=1.6, high_beta_penalty=12.0,
+    cap_max_after_cut=55.0, cap_max_after_cov=45.0
+)
+
+def _beta_map(b, knots, scores):
+    if not np.isfinite(b): return 50.0
+    return float(np.interp(b, knots, scores, left=scores[0], right=scores[-1]))
+
+def build_scores(df: pd.DataFrame, weights: dict, params: dict,
+                 *, fixed_denominator: bool=True, missing_policy: str="neutral50") -> pd.DataFrame:
+    P = {**PARAMS_DEF, **(params or {})}
     d = df.copy()
-    d["sc_yield"]     = (np.clip((d["div_yield_ttm"] - 0.05) / 0.05, 0, 1) * 100)
-    d["sc_52w"]       = ((1 - d["pos_52w"]).clip(0, 1) * 100)
-    d["sc_pe"]        = _sector_percentile(d, "pe_ttm", invert=True)
-    d["sc_ev_ebitda"] = _sector_percentile(d, "ev_ebitda_ttm", invert=True)
-    d["sc_de"]        = _sector_percentile(d, "de_ratio", invert=True)
-    d.loc[~np.isfinite(d["de_ratio"]) | (d["de_ratio"] < 0), "sc_de"] = 0
-    d["sc_fcfm"]      = _sector_percentile(d, "fcf_margin_ttm", invert=False)
-    d["sc_ebitdam"]   = _sector_percentile(d, "ebitda_margin_ttm", invert=False)
-    d["sc_beta"]      = d["beta_2y_w"].apply(lambda b: _map_beta(b) if np.isfinite(b) else 50.0)
 
-    ygap = np.where(d["yield_5y_median"] > 0,
-                    d["div_yield_ttm"] / d["yield_5y_median"] - 1.0,
-                    np.nan)
-    d["sc_ygap"] = _sector_percentile(pd.DataFrame({"sector": d["sector"], "ygap": ygap}), "ygap", invert=False)
+    d["sc_yield"] = (np.clip((d["div_yield_ttm"]-P["yield_floor"])/P["yield_scale"],0,1)*100)
+    base = (1-d["pos_52w"]) if P["invert_52w"] else d["pos_52w"]
+    d["sc_52w"] = (np.clip(base,0,1)**P["pos_52w_gamma"])*100
+    d["sc_pe"]        = _sector_percentile(d,"pe_ttm",invert=True)
+    d["sc_ev_ebitda"] = _sector_percentile(d,"ev_ebitda_ttm",invert=True)
+    d["sc_de"]        = _sector_percentile(d,"de_ratio",invert=True)
+    d.loc[(~np.isfinite(d["de_ratio"]))|(d["de_ratio"]<0),"sc_de"]=0
+    d["sc_fcfm"]      = _sector_percentile(d,"fcf_margin_ttm",invert=False)
+    d["sc_ebitdam"]   = _sector_percentile(d,"ebitda_margin_ttm",invert=False)
+    d["sc_beta"]      = d["beta_2y_w"].apply(lambda b: _beta_map(b,P["beta_knots"],P["beta_scores"]))
 
-    S = d[list(DEFAULT_WEIGHTS.keys())].astype(float)
-    w = pd.Series(wdict).reindex(S.columns).fillna(0.0)
-    num = (S * w).sum(axis=1, skipna=True)
-    den = ((~S.isna()) * w).sum(axis=1)
-    d["score_raw"] = np.where(den > 0, num / den, np.nan)
+    ygap=np.where(d["yield_5y_median"]>0, d["div_yield_ttm"]/d["yield_5y_median"]-1.0, np.nan)
+    d["sc_ygap"]=_sector_percentile(pd.DataFrame({"sector":d["sector"],"ygap":ygap}),"ygap",invert=False)
 
-    cap = d["score_raw"].copy()
-    cap = np.where(d["div_cut_24m"] == 1, np.minimum(cap, 59), cap)
-    cap = np.where((d["fcf_payout_ttm"] > 1.0) | (d["coverage_fcf_ttm"] < 1.0), np.minimum(cap, 49), cap)
-    cap = np.where((d["de_ratio"] > 2.5), cap - 15, cap)
-    cap = np.where((d["beta_2y_w"] > 1.5), cap - 10, cap)
-    cap = np.where((d["pos_52w"] < 0.10) & ((d["fcf_margin_ttm"] <= 0) | (d["ebitda_margin_ttm"] <= 0)), np.minimum(cap, 49), cap)
+    S=d[FACTORS].astype(float)
+    if missing_policy=="neutral50":
+        S=S.fillna(50.0)
+    elif missing_policy=="sector_median":
+        for c in S.columns:
+            med=d.groupby("sector")[c].transform("median")
+            S[c]=S[c].fillna(med).fillna(50.0)
 
-    d["score"] = pd.Series(cap, index=d.index).clip(0, 100)
-    d["rating"] = np.select([d["score"] >= 75, (d["score"] >= 60) & (d["score"] < 75)],
-                            ["BUY", "ACCUMULATE/WATCH"], default="AVOID/HOLD")
+    W=pd.Series(weights).reindex(FACTORS).fillna(0.0)
+    num=(S*W).sum(axis=1)
+    den=float(W.sum()) if fixed_denominator else ((~S.isna())*W).sum(axis=1)
+    d["score_raw"]=np.where(den>0,num/den,np.nan)
+
+    cap=d["score_raw"].copy()
+    cap=np.where(d["div_cut_24m"]==1, np.minimum(cap,P["cap_max_after_cut"]), cap)
+    cap=np.where((d["fcf_payout_ttm"]>1.0)|(d["coverage_fcf_ttm"]<1.0), np.minimum(cap,P["cap_max_after_cov"]), cap)
+    cap=np.where((d["de_ratio"]>P["de_threshold"]), cap-P["high_de_penalty"], cap)
+    cap=np.where((d["beta_2y_w"]>P["beta_threshold"]), cap-P["high_beta_penalty"], cap)
+
+    d["score"]=pd.Series(cap,index=d.index).clip(0,100)
+    d["rating"]=np.select([d["score"]>=75,(d["score"]>=60)&(d["score"]<75)],["BUY","ACCUMULATE/WATCH"],"AVOID/HOLD")
     return d
 
 # ─────────────────────────────────────────────────────────────
-# Pipeline
+# Sidebar — Inputs
 # ─────────────────────────────────────────────────────────────
-def run_scoring(
-    tickers: Iterable[str],
-    min_yield: float = 0.05,
-    min_mcap: float = 1_000_000_000,
-    min_adv: float = 1_500_000,
-    exclude_financials: bool = True,
-    drop_prefilter_fails: bool = True,
-    max_workers: int = 6,
-    weights: Dict[str, float] | None = None,
-) -> pd.DataFrame:
-    tickers = sorted({t.strip().upper() for t in tickers if t and isinstance(t, str)})
-    if not tickers:
-        return pd.DataFrame(columns=EXPECTED_COLS)
-
-    rows, errors = [], []
-    pbar = st.progress(0.0, text="Kennzahlen: 0/0")
-    total = len(tickers)
-    done = 0
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(metrics_for, tk): tk for tk in tickers}
-        for fut in as_completed(futs):
-            tk = futs[fut]
-            try:
-                rows.append(fut.result())
-            except Exception as e:
-                errors.append((tk, str(e)))
-                rows.append({"ticker": tk, "error": str(e)})
-            done += 1
-            pbar.progress(done / total, text=f"Kennzahlen: {done}/{total}")
-
-    df = _ensure_columns(pd.DataFrame(rows))
-
-    df["pf_yield"]  = df["div_yield_ttm"] >= min_yield
-    df["pf_mcap"]   = np.isfinite(df["market_cap"]) & (df["market_cap"] >= min_mcap)
-    df["pf_adv"]    = np.isfinite(df["adv_3m"]) & (df["adv_3m"] >= min_adv)
-    df["pf_sector"] = ~(df["sector"].fillna("Unknown").str.contains("Financial", na=False)) \
-                      if exclude_financials else pd.Series(True, index=df.index)
-    df["prefilter_pass"] = df[["pf_yield","pf_mcap","pf_adv","pf_sector"]].all(axis=1)
-
-    base = df[df["prefilter_pass"]].copy() if drop_prefilter_fails else df.copy()
-    if base.empty:
-        out = df.copy()
-        out["score"] = np.nan
-        out["rating"] = "PF-FAIL (check filters)"
-        out["div_yield_%"] = out["div_yield_ttm"] * 100
-        out["pos_52w_%"] = out["pos_52w"] * 100
-        out["near_52w_low_%"] = (1 - out["pos_52w"]).clip(0, 1) * 100
-        num_cols = out.select_dtypes(include=[np.number]).columns
-        out[num_cols] = out[num_cols].round(2)
-        return out
-
-    scored = build_scores(base, weights=weights)
-    out = scored.copy()
-    out["div_yield_%"] = out["div_yield_ttm"] * 100
-    out["pos_52w_%"] = out["pos_52w"] * 100
-    out["near_52w_low_%"] = (1 - out["pos_52w"]).clip(0, 1) * 100
-
-    out = out.sort_values("score", ascending=False).reset_index(drop=True)
-    num_cols = out.select_dtypes(include=[np.number]).columns
-    out[num_cols] = out[num_cols].round(2)
-    return out
-
-# ─────────────────────────────────────────────────────────────
-# Sidebar – Inputs
-# ─────────────────────────────────────────────────────────────
-st.sidebar.header("📥 Eingabedaten")
-
-csv_file = st.sidebar.file_uploader("CSV mit Tickern hochladen", type=["csv"])
-uploaded_syms = []
+st.sidebar.header("📥 Eingabe")
+csv_file=st.sidebar.file_uploader("CSV mit Ticker-Spalte", type=["csv"])
+tickers=[]
 if csv_file is not None:
-    try:
-        df_csv = pd.read_csv(csv_file)
-    except Exception:
-        csv_file.seek(0); df_csv = pd.read_csv(csv_file, sep=";")
-    col = st.sidebar.selectbox("Spalte mit Tickern auswählen", df_csv.columns.tolist())
-    uploaded_syms = df_csv[col].astype(str).str.strip().replace({"nan": np.nan}).dropna().tolist()
-    st.sidebar.success(f"{len(uploaded_syms)} Ticker aus CSV")
+    try: df_csv=pd.read_csv(csv_file)
+    except Exception: csv_file.seek(0); df_csv=pd.read_csv(csv_file, sep=";")
+    col=st.sidebar.selectbox("Ticker-Spalte", df_csv.columns.tolist())
+    tickers=df_csv[col].astype(str).str.strip().replace({"nan":np.nan}).dropna().tolist()
+manual = st.sidebar.text_area("Ticker manuell (kommasepariert)", "DHL.DE, DBK.DE, T, VZ, MO")
+tickers=sorted({*tickers, *[s.strip().upper() for s in manual.split(",") if s.strip()]})
+st.sidebar.caption(f"Watchlist: **{len(tickers)}**")
 
-manual = st.sidebar.text_area("Ticker manuell (kommasepariert)", placeholder="z.B. T, VZ, MO, RIO, BTI")
-manual_syms = [s.strip().upper() for s in manual.split(",") if s.strip()] if manual else []
+# ─────────────────────────────────────────────────────────────
+# Sidebar — Parameter & Gewichte
+# ─────────────────────────────────────────────────────────────
+st.sidebar.header("⚙️ Scoring-Parameter")
+P0=PARAMS_DEF
+y_floor=st.sidebar.number_input("Yield-Floor", min_value=0.0, max_value=0.5, value=float(P0["yield_floor"]), step=0.005, format="%.3f")
+y_scale=st.sidebar.number_input("Yield-Scale", min_value=0.001, max_value=1.0, value=float(P0["yield_scale"]), step=0.005, format="%.3f")
+invert_52w=st.sidebar.checkbox("52W invertieren (nah am Low = besser)", value=True)
+pos_gamma =st.sidebar.slider("52W-Gamma", 0.3, 3.0, float(P0["pos_52w_gamma"]), 0.1)
 
-st.sidebar.subheader("📚 Index hinzufügen")
-index_choice = st.sidebar.selectbox(
-    "Index",
-    [
-        "– auswählen –",
-        "DAX", "MDAX",
-        "FTSE 100", "FTSE 250",
-        "S&P 500",
-        "S&P 500 Div. Aristocrats",
-        "S&P 400 Div. Aristocrats",
-        "S&P/TSX 60",
-        "S&P/ASX 200",
-        "Dow Jones 30",
-    ]
+c1,c2,c3,c4=st.sidebar.columns(4)
+beta_lo=c1.number_input("β lo", 0.0, 3.0, float(P0["beta_knots"][0]), 0.05)
+beta_m1=c2.number_input("β m1", 0.0, 3.0, float(P0["beta_knots"][1]), 0.05)
+beta_m2=c3.number_input("β m2", 0.0, 3.0, float(P0["beta_knots"][2]), 0.05)
+beta_hi=c4.number_input("β hi", 0.0, 3.0, float(P0["beta_knots"][3]), 0.05)
+knots=[beta_lo,beta_m1,beta_m2,beta_hi]
+if any(np.diff(knots)<0):
+    knots=sorted(knots)
+    st.sidebar.info("β-Knoten wurden aufsteigend sortiert.")
+
+c5,c6,c7,c8=st.sidebar.columns(4)
+pts_lo=c5.number_input("Pts lo", 0.0, 100.0, float(P0["beta_scores"][0]), 1.0)
+pts_m1=c6.number_input("Pts m1", 0.0, 100.0, float(P0["beta_scores"][1]), 1.0)
+pts_m2=c7.number_input("Pts m2", 0.0, 100.0, float(P0["beta_scores"][2]), 1.0)
+pts_hi=c8.number_input("Pts hi", 0.0, 100.0, float(P0["beta_scores"][3]), 1.0)
+scores=[pts_lo,pts_m1,pts_m2,pts_hi]
+
+de_thr =st.sidebar.number_input("D/E-Schwelle", 0.0, 10.0, float(P0["de_threshold"]), 0.1)
+de_pen =st.sidebar.number_input("Strafe D/E", 0.0, 50.0, float(P0["high_de_penalty"]), 1.0)
+beta_thr=st.sidebar.number_input("Beta-Schwelle", 0.0, 3.0, float(P0["beta_threshold"]), 0.1)
+beta_pen=st.sidebar.number_input("Strafe Beta", 0.0, 50.0, float(P0["high_beta_penalty"]), 1.0)
+cap_cut=st.sidebar.number_input("Cap nach Div-Cut (max Score)", 0.0, 100.0, float(P0["cap_max_after_cut"]), 1.0)
+cap_cov=st.sidebar.number_input("Cap bei schwacher Coverage (max Score)", 0.0, 100.0, float(P0["cap_max_after_cov"]), 1.0)
+
+params=dict(
+    yield_floor=y_floor, yield_scale=y_scale,
+    invert_52w=invert_52w, pos_52w_gamma=pos_gamma,
+    beta_knots=knots, beta_scores=scores,
+    de_threshold=de_thr, high_de_penalty=de_pen,
+    beta_threshold=beta_thr, high_beta_penalty=beta_pen,
+    cap_max_after_cut=cap_cut, cap_max_after_cov=cap_cov
 )
-index_syms = []
-if index_choice != "– auswählen –":
-    try:
-        key_map = {
-            "ftse 100": "ftse100",
-            "ftse 250": "ftse250",
-            "dow jones 30": "dow jones 30",
-            "s&p 500": "s&p 500",
-            "s&p 500 div. aristocrats": "sp500_diva",
-            "s&p 400 div. aristocrats": "sp400_diva",
-            "s&p/tsx 60": "tsx60",
-            "s&p/asx 200": "asx200",
-        }
-        idx_key = key_map.get(index_choice.lower(), index_choice)
-        index_syms = load_index_members(idx_key)
-        st.sidebar.info(f"{index_choice}: {len(index_syms)} Werte geladen")
-    except Exception as e:
-        st.sidebar.error(f"Index-Fehler: {e}")
 
-watchlist = sorted({*uploaded_syms, *manual_syms, *index_syms})
-st.sidebar.caption(f"Gesamt-Watchlist: **{len(watchlist)}** Ticker")
+st.sidebar.subheader("⚖️ Gewichte")
+tmp_w={}
+labels={"sc_yield":"Yield","sc_52w":"52W","sc_pe":"PE(inv)","sc_ev_ebitda":"EV/EBITDA(inv)","sc_de":"D/E(inv)","sc_fcfm":"FCF-Marge","sc_ebitdam":"EBITDA-Marge","sc_beta":"Beta","sc_ygap":"Yield-Gap"}
+for k in FACTORS:
+    tmp_w[k]=st.sidebar.slider(labels.get(k,k), 0.0, 1.0, float(DEFAULT_W.get(k,0.0)), 0.01)
+sum_w=sum(tmp_w.values())
+weights={k:(v/sum_w) for k,v in tmp_w.items()} if sum_w>0 else DEFAULT_W
+st.sidebar.caption(f"Gewichtssumme (normalisiert): **{sum(weights.values()):.2f}**")
+
+st.sidebar.subheader("🧩 Aggregation/Fehlwerte")
+fixed_den=st.sidebar.checkbox("Feste Gewichtssumme (kein Re-Weighting)", value=True)
+missing_policy=st.sidebar.selectbox("Missing-Policy", ["neutral50","sector_median","skip"], index=0)
+
+run = st.sidebar.button("🔎 Score berechnen", use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────
-# Sidebar – Filter & editierbare Gewichte
-# ─────────────────────────────────────────────────────────────
-st.sidebar.header("⚙️ Filter & Optionen")
-min_yield = st.sidebar.number_input("Min. Dividendenrendite", min_value=0.0, max_value=0.3, value=0.05, step=0.005, format="%.3f")
-min_mcap  = st.sidebar.number_input("Min. Market Cap (USD)", min_value=0.0, value=1_000_000_000.0, step=100_000_000.0, format="%.0f")
-min_adv   = st.sidebar.number_input("Min. 3M ADV (Shares)", min_value=0.0, value=1_500_000.0, step=100_000.0, format="%.0f")
-exclude_financials = st.sidebar.checkbox("Finanzsektor ausschließen", value=True)
-drop_pf = st.sidebar.checkbox("Nur Pre-Filter-Pass zeigen", value=True)
-max_workers = st.sidebar.slider("Parallel-Worker", 1, 12, 6)
-
-st.sidebar.subheader("⚖️ Gewichte (Score-Komponenten)")
-if "weights" not in st.session_state:
-    st.session_state.weights = DEFAULT_WEIGHTS.copy()
-
-c_reset, c_norm = st.sidebar.columns([1,1])
-with c_reset:
-    if st.button("↩️ Standard", use_container_width=True):
-        st.session_state.weights = DEFAULT_WEIGHTS.copy()
-with c_norm:
-    auto_norm = st.checkbox("Normieren", value=True, help="Skaliert die Gewichte so, dass die Summe 1.0 ergibt")
-
-label_map = {
-    "sc_yield": "Yield",
-    "sc_52w": "52W-Position (umgekehrt)",
-    "sc_pe": "P/E (Sektor, invertiert)",
-    "sc_ev_ebitda": "EV/EBITDA (invertiert)",
-    "sc_de": "Debt/Equity (invertiert)",
-    "sc_fcfm": "FCF-Marge",
-    "sc_ebitdam": "EBITDA-Marge",
-    "sc_beta": "Beta",
-    "sc_ygap": "Yield-/Median-Gap",
-}
-
-tmp_weights = {}
-for k, default in DEFAULT_WEIGHTS.items():
-    tmp_weights[k] = st.sidebar.slider(
-        label_map.get(k, k),
-        0.0, 1.0,
-        float(st.session_state.weights.get(k, default)),
-        0.01
-    )
-
-total_w = sum(tmp_weights.values())
-if auto_norm and total_w > 0:
-    weights = {k: v / total_w for k, v in tmp_weights.items()}
-else:
-    weights = tmp_weights
-
-# persist current slider positions
-st.session_state.weights = tmp_weights
-st.sidebar.caption(f"Gewichtssumme: **{sum(weights.values()):.2f}**")
-
-run_btn = st.sidebar.button("🔎 Score berechnen", use_container_width=True)
-
-
-# ─────────────────────────────────────────────────────────────
-# Main – Output
+# Main
 # ─────────────────────────────────────────────────────────────
 st.subheader("Watchlist")
-if watchlist:
-    with st.expander(f"Watchlist anzeigen ({len(watchlist)} Ticker)"):
-        st.code(", ".join(map(str, watchlist)), wrap_lines=True)
+if tickers:
+    with st.expander(f"anzeigen ({len(tickers)})"):
+        st.code(", ".join(tickers), wrap_lines=True)
 else:
-    st.info("Lade eine CSV hoch, füge Ticker manuell hinzu oder wähle einen Index.")
+    st.info("CSV laden oder Ticker manuell eingeben.")
 
-if run_btn and watchlist:
-    df = run_scoring(
-        watchlist,
-        min_yield=min_yield, min_mcap=min_mcap, min_adv=min_adv,
-        exclude_financials=exclude_financials, drop_prefilter_fails=drop_pf,
-        max_workers=max_workers,
-        weights=weights,
-    )
+if run and tickers:
+    rows=[]; pbar=st.progress(0.0, text="Kennzahlen: 0/0")
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs={ex.submit(fetch_metrics, tk): tk for tk in tickers}
+        done=0
+        for fut in as_completed(futs):
+            rows.append(fut.result()); done+=1
+            pbar.progress(done/len(futs), text=f"Kennzahlen: {done}/{len(futs)}")
 
-    st.subheader("Ergebnisse")
-    if not df.empty:
-        counts = df["rating"].value_counts(dropna=False)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("BUY", int(counts.get("BUY", 0)))
-        c2.metric("ACCUMULATE/WATCH", int(counts.get("ACCUMULATE/WATCH", 0)))
-        c3.metric("AVOID/HOLD", int(counts.get("AVOID/HOLD", 0)))  # ← fix: korrektes Quote
-        c4.metric("Total", len(df))
+    df=pd.DataFrame(rows)
+    base=df[df["error"].isna()].copy()
+    if base.empty:
+        st.warning("Keine verwertbaren Daten."); st.dataframe(df, use_container_width=True); st.stop()
 
-        prefer_cols = [
-            "ticker","sector","price","div_yield_%","near_52w_low_%",
-            "pe_ttm","ev_ebitda_ttm","de_ratio","fcf_margin_ttm","ebitda_margin_ttm",
-            "beta_2y_w","market_cap","adv_3m","score","rating","error"
-        ]
-        show_cols = [c for c in prefer_cols if c in df.columns]
-        st.dataframe(
-            df[show_cols],
-            use_container_width=True,
-            column_config={
-                "div_yield_%": st.column_config.NumberColumn("DivR %", format="%.2f"),
-                "near_52w_low_%": st.column_config.NumberColumn("Nähe 52W-Low %", format="%.2f"),
-                "price": st.column_config.NumberColumn("Price", format="%.2f"),
-                "pe_ttm": st.column_config.NumberColumn("PE (TTM)", format="%.2f"),
-                "ev_ebitda_ttm": st.column_config.NumberColumn("EV/EBITDA", format="%.2f"),
-                "de_ratio": st.column_config.NumberColumn("Debt/Equity", format="%.2f"),
-                "fcf_margin_ttm": st.column_config.NumberColumn("FCF-Marge", format="%.2f"),
-                "ebitda_margin_ttm": st.column_config.NumberColumn("EBITDA-Marge", format="%.2f"),
-                "beta_2y_w": st.column_config.NumberColumn("Beta (2Y W)", format="%.2f"),
-                "market_cap": st.column_config.NumberColumn("Market Cap", format="%.0f"),
-                "adv_3m": st.column_config.NumberColumn("ADV 3M", format="%.0f"),
-                "score": st.column_config.NumberColumn("Score", format="%.2f"),
-            },
-        )
+    scored=build_scores(base, weights=weights, params=params, fixed_denominator=fixed_den, missing_policy=missing_policy)
+    out=scored.copy()
+    out["div_yield_%"]=out["div_yield_ttm"]*100
+    out["near_52w_low_%"]=(1-out["pos_52w"]).clip(0,1)*100
 
-        # ── Exporte (US-CSV, EU-CSV, Excel)
-        from io import BytesIO
-        ts = pd.Timestamp.now(tz="Europe/Zurich").strftime("%Y-%m-%d_%H%M")
+    cols=["ticker","sector","price","low_52w","high_52w","pos_52w","near_52w_low_%",
+          "pe_ttm","ev_ebitda_ttm","de_ratio","fcf_margin_ttm","ebitda_margin_ttm",
+          "beta_2y_w","market_cap","adv_3m","score","rating","error"]
+    st.subheader("Ergebnisse (Ranking)")
+    st.dataframe(out.sort_values("score", ascending=False).reset_index(drop=True).round(3)[cols], use_container_width=True)
 
-        c_us, c_eu, c_xlsx = st.columns(3)  # drei Spalten erzeugen
+    # Executive Summary
+    st.markdown("### Executive Summary")
+    vc=out["rating"].value_counts()
+    kpi_total=len(out); kpi_buy=int(vc.get("BUY",0)); kpi_acc=int(vc.get("ACCUMULATE/WATCH",0)); kpi_hold=int(vc.get("AVOID/HOLD",0))
+    kpi_score_avg=float(out["score"].mean()); kpi_yield_med=float(out["div_yield_%"].median())
+    kpi_nearlow_med=float(out["near_52w_low_%"].median()); kpi_de_med=float(out["de_ratio"].median(skipna=True)) if np.isfinite(out["de_ratio"].median(skipna=True)) else np.nan
+    c1,c2,c3,c4,c5=st.columns(5)
+    c1.metric("Total",kpi_total); c2.metric("BUY",kpi_buy); c3.metric("ACC/W",kpi_acc)
+    c4.metric("Score ⌀",f"{kpi_score_avg:.1f}"); c5.metric("Yield (Med.)",f"{kpi_yield_med:.2f}%")
+    c6,c7=st.columns(2)
+    c6.metric("Nähe 52W-Low (Med.)", f"{kpi_nearlow_med:.1f}%")
+    c7.metric("D/E (Med.)", f"{kpi_de_med:.2f}" if np.isfinite(kpi_de_med) else "n/a")
 
-        csv_us = df.to_csv(index=False).encode("utf-8")
-        csv_eu = df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")  # EU: ; und Komma
+    # Top-10 Faktor-Beiträge
+    st.markdown("### Top 10 – Faktor-Beitrag")
+    label_short={"sc_yield":"Yield","sc_52w":"52W","sc_pe":"PE(inv)","sc_ev_ebitda":"EV/EBITDA(inv)","sc_de":"D/E(inv)","sc_fcfm":"FCF%","sc_ebitdam":"EBITDA%","sc_beta":"Beta","sc_ygap":"YieldGap"}
+    top=out.sort_values("score",ascending=False).head(10).copy()
+    S=top[FACTORS].astype(float); Wser=pd.Series(weights).reindex(FACTORS).fillna(0.0)
+    contrib=S.mul(Wser,axis=1); contrib.columns=[label_short.get(c,c) for c in contrib.columns]
+    contrib.insert(0,"ticker",top["ticker"].values); contrib.insert(1,"score",top["score"].values)
+    st.dataframe(contrib.set_index("ticker").round(2), use_container_width=True)
 
-        with c_us:
-            st.download_button(
-                "⬇️ CSV (US, , .)",
-                data=csv_us,
-                file_name=f"high_yield_scores_{ts}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+    # Faktor-Heatmap
+    st.markdown("### Universum – Faktor-Heatmap (Median 0–100)")
+    factor_meds=out[FACTORS].median().rename(lambda c: label_short.get(c,c))
+    st.dataframe(pd.DataFrame(factor_meds,columns=["Median"]).T.style.background_gradient(axis=1), use_container_width=True)
 
-        with c_eu:
-            st.download_button(
-                "⬇️ CSV (EU, ; , ,)",
-                data=csv_eu,
-                file_name=f"high_yield_scores_{ts}_eu.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+    # Kurz-Kommentar (NaN-sicher)
+    bias = "Contrarian-Bias (nah am 52W-Low belohnt)" if params["invert_52w"] else "Momentum-Bias (Nähe 52W-High belohnt)"
+    score_str=f"{kpi_score_avg:.1f}" if np.isfinite(kpi_score_avg) else "n/a"
+    yield_str=f"{kpi_yield_med:.2f}%" if np.isfinite(kpi_yield_med) else "n/a"
+    nearlow_str=f"{kpi_nearlow_med:.1f}%" if np.isfinite(kpi_nearlow_med) else "n/a"
+    de_str=f"{kpi_de_med:.2f}" if np.isfinite(kpi_de_med) else "n/a"
+    st.markdown("### Zusammenfassung")
+    st.write(f"Coverage: {kpi_total} Titel; BUY {kpi_buy}, ACC/W {kpi_acc}, AVOID/HOLD {kpi_hold}. "
+             f"Score Ø {score_str}; Yield (Med.) {yield_str}. {bias}. "
+             f"Median Nähe 52W-Low {nearlow_str}; D/E (Med.) {de_str}.")
 
-        with c_xlsx:
-            try:
-                buf = BytesIO()
-                df.to_excel(buf, index=False, sheet_name="Scores")
-                buf.seek(0)
-                st.download_button(
-                    "⬇️ Excel (.xlsx)",
-                    data=buf.getvalue(),
-                    file_name=f"high_yield_scores_{ts}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.warning(f"Excel-Export vorübergehend deaktiviert: {e}")
-                st.download_button(
-                    "⬇️ CSV (EU, Fallback)",
-                    data=csv_eu,
-                    file_name=f"high_yield_scores_{ts}_eu.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
+    # Exporte
+    ts=pd.Timestamp.now().strftime("%Y-%m-%d_%H%M")
+    c_us,c_eu,c_xlsx=st.columns(3)
+    with c_us:
+        st.download_button("⬇️ CSV (US)", out.to_csv(index=False).encode("utf-8"),
+                           file_name=f"scores_{ts}.csv", mime="text/csv", use_container_width=True)
+    with c_eu:
+        st.download_button("⬇️ CSV (EU)", out.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+                           file_name=f"scores_{ts}_eu.csv", mime="text/csv", use_container_width=True)
+    with c_xlsx:
+        buf=BytesIO(); out.to_excel(buf, index=False, sheet_name="Scores"); buf.seek(0)
+        st.download_button("⬇️ Excel", buf.getvalue(),
+                           file_name=f"scores_{ts}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True)
 
-        # ── Fehler-/Hinweis-Tabelle
-        err_df = df[df["error"].notna()][["ticker","error"]]
-        if not err_df.empty:
-            st.warning("Hinweise/Fehler beim Laden einiger Ticker:")
-            st.dataframe(err_df, use_container_width=True)
-    else:
-        st.info("Keine verwertbaren Ergebnisse für aktuelle Filter.")
+    # Fehlerliste
+    err=df[df["error"].notna()][["ticker","error"]]
+    if not err.empty:
+        st.warning("Hinweise/Fehler beim Laden einiger Ticker:")
+        st.dataframe(err, use_container_width=True)
+
 else:
-    st.caption("Tipp: Bei EU/UK-Werten Yahoo-Suffixe nutzen (.DE, .L, .VI, .PA, .TO, .AX, …).")
-
-
-
+    st.caption("Tipp: EU/UK-Suffixe (.DE, .L, .TO, .PA, .AX …).")

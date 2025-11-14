@@ -1,6 +1,4 @@
 # app.py
-# High-Yield Dividend Scoring – Streamlit (ohne Wikipedia-Index, parametrisierbar)
-
 from __future__ import annotations
 from typing import Dict, List, Iterable
 from io import BytesIO
@@ -10,16 +8,11 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-# ─────────────────────────────────────────────────────────────
-# Seite
-# ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Master Scoring Model", layout="wide")
 st.title("📈 Master Scoring Model")
 st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • robuste Datenlogik")
 
-# ─────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────
+# ───────── Helpers
 def _row(df: pd.DataFrame, keys: List[str]) -> pd.Series:
     for k in keys:
         if isinstance(df, pd.DataFrame) and k in df.index:
@@ -78,9 +71,7 @@ def _safe_info(t: yf.Ticker) -> Dict:
 def _safe_fast(t: yf.Ticker) -> Dict:
     return getattr(t, "fast_info", {}) or {}
 
-# ─────────────────────────────────────────────────────────────
-# Erwartete Spalten
-# ─────────────────────────────────────────────────────────────
+# ───────── Expected cols
 EXPECTED_COLS = [
     "ticker","sector","price","div_yield_ttm","yield_5y_median",
     "low_52w","high_52w","pos_52w",
@@ -96,9 +87,7 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = np.nan
     return df
 
-# ─────────────────────────────────────────────────────────────
-# Kurs-Historie
-# ─────────────────────────────────────────────────────────────
+# ───────── History
 def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
     try:
         h = t.history(period=period, interval=interval, auto_adjust=True)
@@ -108,9 +97,7 @@ def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
         pass
     return pd.Series(dtype=float)
 
-# ─────────────────────────────────────────────────────────────
-# Metrics (TTM, robust, GBX-fix)
-# ─────────────────────────────────────────────────────────────
+# ───────── Metrics
 @st.cache_data(ttl=60*30)
 def metrics_for(ticker: str) -> Dict:
     t = yf.Ticker(ticker)
@@ -193,25 +180,25 @@ def metrics_for(ticker: str) -> Dict:
         div_cash_ttm = abs(div_paid_cf) if np.isfinite(div_paid_cf) else div_ttm_current
 
         equity = _ttm_sum(q_bs, ["Total Stockholder Equity","Total Equity Gross Minority Interest"])
-        total_debt_cf = _ttm_sum(q_bs, ["Long Term Debt"]) + _ttm_sum(q_bs, ["Short Long Term Debt","Short Term Debt"])
-        total_debt_cf = total_debt_cf if np.isfinite(total_debt_cf) else np.nan
+        total_deb_cf = _ttm_sum(q_bs, ["Long Term Debt"]) + _ttm_sum(q_bs, ["Short Long Term Debt","Short Term Debt"])
+        total_deb_cf = total_deb_cf if np.isfinite(total_deb_cf) else np.nan
 
         sector = (info.get("sector") or "Unknown")
         mcap = _to_float(info.get("marketCap", fast.get("market_cap")))
         adv3 = _to_float(info.get("averageDailyVolume3Month", fast.get("three_month_average_volume")))
 
-        total_debt = _to_float(info.get("totalDebt", total_debt_cf))
+        total_debt = _to_float(info.get("totalDebt", total_deb_cf))
         cash = _to_float(info.get("totalCash", np.nan))
 
         de_ratio = (total_debt / equity) if (np.isfinite(total_debt) and np.isfinite(equity) and equity > 0) else np.nan
-        pe_ttm = _to_float(info.get("trailingPE", np.nan))
+        pe_ttm   = _to_float(info.get("trailingPE", np.nan))
 
         ev_num = (mcap if np.isfinite(mcap) else np.nan)
         if np.isfinite(ev_num):
             ev_num += (total_debt if np.isfinite(total_debt) else 0) - (cash if np.isfinite(cash) else 0)
         ev_ebitda = (ev_num / ebitda) if (np.isfinite(ev_num) and np.isfinite(ebitda) and ebitda > 0) else np.nan
 
-        fcf_margin = (fcf / revenue) if (np.isfinite(fcf) and np.isfinite(revenue) and revenue > 0) else np.nan
+        fcf_margin    = (fcf / revenue) if (np.isfinite(fcf) and np.isfinite(revenue) and revenue > 0) else np.nan
         ebitda_margin = (ebitda / revenue) if (np.isfinite(ebitda) and np.isfinite(revenue) and revenue > 0) else np.nan
 
         try:
@@ -253,9 +240,7 @@ def metrics_for(ticker: str) -> Dict:
     except Exception as e:
         return {"ticker": ticker, "error": str(e)}
 
-# ─────────────────────────────────────────────────────────────
-# Scoring – Defaults & editierbare Gewichte/Parameter
-# ─────────────────────────────────────────────────────────────
+# ───────── Scoring
 DEFAULT_WEIGHTS: Dict[str, float] = {
     "sc_yield": 0.22, "sc_52w": 0.18, "sc_pe": 0.12, "sc_ev_ebitda": 0.12,
     "sc_de": 0.12, "sc_fcfm": 0.08, "sc_ebitdam": 0.06, "sc_beta": 0.06, "sc_ygap": 0.04,
@@ -283,15 +268,12 @@ def build_scores(df: pd.DataFrame,
     P = {**SCORING_DEFAULTS, **(params or {})}
     d = df.copy()
 
-    # Yield-Mapping
     y_floor = P["yield_floor"]; y_scale = P["yield_scale"]
     d["sc_yield"] = (np.clip((d["div_yield_ttm"] - y_floor) / y_scale, 0, 1) * 100)
 
-    # 52W-Position
     base = (1 - d["pos_52w"]) if P["invert_52w"] else d["pos_52w"]
     d["sc_52w"] = (np.clip(base, 0, 1) ** P["pos_52w_gamma"]) * 100
 
-    # Sektor-Perzentile
     d["sc_pe"]        = _sector_percentile(d, "pe_ttm", invert=True)
     d["sc_ev_ebitda"] = _sector_percentile(d, "ev_ebitda_ttm", invert=True)
     d["sc_de"]        = _sector_percentile(d, "de_ratio", invert=True)
@@ -299,25 +281,21 @@ def build_scores(df: pd.DataFrame,
     d["sc_fcfm"]      = _sector_percentile(d, "fcf_margin_ttm", invert=False)
     d["sc_ebitdam"]   = _sector_percentile(d, "ebitda_margin_ttm", invert=False)
 
-    # Beta
     d["sc_beta"] = d["beta_2y_w"].apply(
         lambda b: _map_beta_param(b, P["beta_knots"], P["beta_scores"]) if np.isfinite(b) else 50.0
     )
 
-    # Yield-Gap
     ygap = np.where(d["yield_5y_median"] > 0,
                     d["div_yield_ttm"] / d["yield_5y_median"] - 1.0,
                     np.nan)
     d["sc_ygap"] = _sector_percentile(pd.DataFrame({"sector": d["sector"], "ygap": ygap}), "ygap", invert=False)
 
-    # Gewichtung
     S = d[list(DEFAULT_WEIGHTS.keys())].astype(float)
     w = pd.Series(wdict).reindex(S.columns).fillna(0.0)
     num = (S * w).sum(axis=1, skipna=True)
     den = ((~S.isna()) * w).sum(axis=1)
     d["score_raw"] = np.where(den > 0, num / den, np.nan)
 
-    # Caps/Strafen
     cap = d["score_raw"].copy()
     cap = np.where(d["div_cut_24m"] == 1, np.minimum(cap, P["cap_max_after_cut"]), cap)
     cap = np.where((d["fcf_payout_ttm"] > 1.0) | (d["coverage_fcf_ttm"] < 1.0),
@@ -332,9 +310,7 @@ def build_scores(df: pd.DataFrame,
                             ["BUY", "ACCUMULATE/WATCH"], default="AVOID/HOLD")
     return d
 
-# ─────────────────────────────────────────────────────────────
-# Pipeline
-# ─────────────────────────────────────────────────────────────
+# ───────── Pipeline
 def run_scoring(
     tickers: Iterable[str],
     min_yield: float = 0.05,
@@ -398,11 +374,8 @@ def run_scoring(
     out[num_cols] = out[num_cols].round(2)
     return out
 
-# ─────────────────────────────────────────────────────────────
-# Sidebar – Inputs (nur CSV/Manuell)
-# ─────────────────────────────────────────────────────────────
+# ───────── Sidebar – Inputs (CSV/Manuell)
 st.sidebar.header("📥 Eingabedaten")
-
 csv_file = st.sidebar.file_uploader("CSV mit Tickern hochladen", type=["csv"])
 uploaded_syms = []
 if csv_file is not None:
@@ -416,13 +389,10 @@ if csv_file is not None:
 
 manual = st.sidebar.text_area("Ticker manuell (kommasepariert)", placeholder="z.B. T, VZ, MO, RIO, BTI")
 manual_syms = [s.strip().upper() for s in manual.split(",") if s.strip()] if manual else []
-
 watchlist = sorted({*uploaded_syms, *manual_syms})
 st.sidebar.caption(f"Gesamt-Watchlist: **{len(watchlist)}** Ticker")
 
-# ─────────────────────────────────────────────────────────────
-# Sidebar – Filter & Gewichte
-# ─────────────────────────────────────────────────────────────
+# ───────── Sidebar – Filter & Gewichte
 st.sidebar.header("⚙️ Filter & Optionen")
 min_yield = st.sidebar.number_input("Min. Dividendenrendite", min_value=0.0, max_value=0.3, value=0.00, step=0.005, format="%.3f")
 min_mcap  = st.sidebar.number_input("Min. Market Cap (USD)", min_value=0.0, value=50_000_000.0, step=50_000_000.0, format="%.0f")
@@ -468,46 +438,44 @@ weights = {k: v / total_w for k, v in tmp_weights.items()} if (auto_norm and tot
 st.session_state.weights = tmp_weights
 st.sidebar.caption(f"Gewichtssumme: **{sum(weights.values()):.2f}**")
 
-# ─────────────────────────────────────────────────────────────
-# Sidebar – Scoring-Parameter (Vorab-Einstellungen)
-# ─────────────────────────────────────────────────────────────
+# ───────── Sidebar – Scoring-Parameter
 st.sidebar.subheader("🧮 Scoring-Parameter")
 
-y_floor = st.sidebar.number_input("Yield-Floor (0=0%)", 0.0, 0.2, value=SCORING_DEFAULTS["yield_floor"], step=0.005, format="%.3f")
-y_scale = st.sidebar.number_input("Yield-Scale (0..1)", 0.001, 0.5, value=SCORING_DEFAULTS["yield_scale"], step=0.005, format="%.3f")
+y_floor = st.sidebar.number_input("Yield-Floor (0=0%)", min_value=0.0, max_value=0.2, value=float(SCORING_DEFAULTS["yield_floor"]), step=0.005, format="%.3f")
+y_scale = st.sidebar.number_input("Yield-Scale (0..1)",   min_value=0.001, max_value=0.5, value=float(SCORING_DEFAULTS["yield_scale"]), step=0.005, format="%.3f")
 
 invert_52w = st.sidebar.checkbox("52W invertieren (nah am Low = besser)", value=SCORING_DEFAULTS["invert_52w"])
 pos_gamma  = st.sidebar.slider("52W-Gamma (Nichtlinearität)", 0.3, 3.0, value=float(SCORING_DEFAULTS["pos_52w_gamma"]), step=0.1)
 
-# ---- FIX: Vier einzelne Inputs für Beta-Knoten und -Scores
+# Beta-Knoten/Scores (einzeln, Typen konsistent)
 c1, c2, c3, c4 = st.sidebar.columns(4)
-beta_lo = c1.number_input("β lo", 0.0, 3.0, value=float(SCORING_DEFAULTS["beta_knots"][0]), step=0.05, key="beta_lo")
-beta_m1 = c2.number_input("β m1", 0.0, 3.0, value=float(SCORING_DEFAULTS["beta_knots"][1]), step=0.05, key="beta_m1")
-beta_m2 = c3.number_input("β m2", 0.0, 3.0, value=float(SCORING_DEFAULTS["beta_knots"][2]), step=0.05, key="beta_m2")
-beta_hi = c4.number_input("β hi", 0.0, 3.0, value=float(SCORING_DEFAULTS["beta_knots"][3]), step=0.05, key="beta_hi")
+beta_lo = c1.number_input("β lo", min_value=0.0, max_value=3.0, value=float(SCORING_DEFAULTS["beta_knots"][0]), step=0.05, key="beta_lo")
+beta_m1 = c2.number_input("β m1", min_value=0.0, max_value=3.0, value=float(SCORING_DEFAULTS["beta_knots"][1]), step=0.05, key="beta_m1")
+beta_m2 = c3.number_input("β m2", min_value=0.0, max_value=3.0, value=float(SCORING_DEFAULTS["beta_knots"][2]), step=0.05, key="beta_m2")
+beta_hi = c4.number_input("β hi", min_value=0.0, max_value=3.0, value=float(SCORING_DEFAULTS["beta_knots"][3]), step=0.05, key="beta_hi")
 
 d1, d2, d3, d4 = st.sidebar.columns(4)
-score_lo = d1.number_input("Pts lo", 0.0, 100.0, value=float(SCORING_DEFAULTS["beta_scores"][0]), step=1.0, key="score_lo")
-score_m1 = d2.number_input("Pts m1", 0.0, 100.0, value=float(SCORING_DEFAULTS["beta_scores"][1]), step=1.0, key="score_m1")
-score_m2 = d3.number_input("Pts m2", 0.0, 100.0, value=float(SCORING_DEFAULTS["beta_scores"][2]), step=1.0, key="score_m2")
-score_hi = d4.number_input("Pts hi", 0.0, 100.0, value=float(SCORING_DEFAULTS["beta_scores"][3]), step=1.0, key="score_hi")
+score_lo = d1.number_input("Pts lo", min_value=0, max_value=100, value=int(SCORING_DEFAULTS["beta_scores"][0]), step=1, key="score_lo")
+score_m1 = d2.number_input("Pts m1", min_value=0, max_value=100, value=int(SCORING_DEFAULTS["beta_scores"][1]), step=1, key="score_m1")
+score_m2 = d3.number_input("Pts m2", min_value=0, max_value=100, value=int(SCORING_DEFAULTS["beta_scores"][2]), step=1, key="score_m2")
+score_hi = d4.number_input("Pts hi", min_value=0, max_value=100, value=int(SCORING_DEFAULTS["beta_scores"][3]), step=1, key="score_hi")
 
 # Monotonie absichern
 knots = [beta_lo, beta_m1, beta_m2, beta_hi]
-scores = [score_lo, score_m1, score_m2, score_hi]
+scores = [float(score_lo), float(score_m1), float(score_m2), float(score_hi)]
 if any(np.diff(knots) < 0):
     order = np.argsort(knots)
     knots  = [knots[i]  for i in order]
     scores = [scores[i] for i in order]
     st.sidebar.info("β-Knoten wurden aufsteigend sortiert.")
 
-de_thr = st.sidebar.number_input("D/E-Schwelle für Strafe", 0.0, 10.0, value=SCORING_DEFAULTS["de_threshold"], step=0.1)
-de_pen = st.sidebar.number_input("Strafe bei hohem D/E", 0.0, 50.0, value=SCORING_DEFAULTS["high_de_penalty"], step=1.0)
-beta_thr = st.sidebar.number_input("Beta-Schwelle für Strafe", 0.0, 3.0, value=SCORING_DEFAULTS["beta_threshold"], step=0.1)
-beta_pen = st.sidebar.number_input("Strafe bei hohem Beta", 0.0, 50.0, value=SCORING_DEFAULTS["high_beta_penalty"], step=1.0)
+de_thr  = st.sidebar.number_input("D/E-Schwelle für Strafe", min_value=0.0, max_value=10.0, value=float(SCORING_DEFAULTS["de_threshold"]), step=0.1)
+de_pen  = st.sidebar.number_input("Strafe bei hohem D/E",     min_value=0,   max_value=50,   value=int(SCORING_DEFAULTS["high_de_penalty"]),  step=1)
+beta_thr= st.sidebar.number_input("Beta-Schwelle für Strafe", min_value=0.0, max_value=3.0,  value=float(SCORING_DEFAULTS["beta_threshold"]), step=0.1)
+beta_pen= st.sidebar.number_input("Strafe bei hohem Beta",    min_value=0,   max_value=50,   value=int(SCORING_DEFAULTS["high_beta_penalty"]), step=1)
 
-cap_cut = st.sidebar.number_input("Cap nach Div-Cut (max Score)", 0.0, 100.0, value=SCORING_DEFAULTS["cap_max_after_cut"], step=1.0)
-cap_cov = st.sidebar.number_input("Cap bei schwacher Coverage (max Score)", 0.0, 100.0, value=SCORING_DEFAULTS["cap_max_after_cov"], step=1.0)
+cap_cut = st.sidebar.number_input("Cap nach Div-Cut (max Score)",       min_value=0, max_value=100, value=int(SCORING_DEFAULTS["cap_max_after_cut"]), step=1)
+cap_cov = st.sidebar.number_input("Cap bei schwacher Coverage (max Score)", min_value=0, max_value=100, value=int(SCORING_DEFAULTS["cap_max_after_cov"]), step=1)
 
 params = {
     "yield_floor": y_floor, "yield_scale": y_scale,
@@ -520,9 +488,7 @@ params = {
 
 run_btn = st.sidebar.button("🔎 Score berechnen", use_container_width=True)
 
-# ─────────────────────────────────────────────────────────────
-# Main – Output
-# ─────────────────────────────────────────────────────────────
+# ───────── Main
 st.subheader("Watchlist")
 if watchlist:
     with st.expander(f"Watchlist anzeigen ({len(watchlist)} Ticker)"):
@@ -574,49 +540,28 @@ if run_btn and watchlist:
             },
         )
 
-        # Exporte
         ts = pd.Timestamp.now(tz="Europe/Vienna").strftime("%Y-%m-%d_%H%M")
         c_us, c_eu, c_xlsx = st.columns(3)
         csv_us = df.to_csv(index=False).encode("utf-8")
         csv_eu = df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
-
         with c_us:
-            st.download_button(
-                "⬇️ CSV (US, , .)",
-                data=csv_us,
-                file_name=f"high_yield_scores_{ts}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ CSV (US, , .)", data=csv_us, file_name=f"high_yield_scores_{ts}.csv", mime="text/csv", use_container_width=True)
         with c_eu:
-            st.download_button(
-                "⬇️ CSV (EU, ; , ,)",
-                data=csv_eu,
-                file_name=f"high_yield_scores_{ts}_eu.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ CSV (EU, ; , ,)", data=csv_eu, file_name=f"high_yield_scores_{ts}_eu.csv", mime="text/csv", use_container_width=True)
         with c_xlsx:
             try:
                 buf = BytesIO()
                 df.to_excel(buf, index=False, sheet_name="Scores")
                 buf.seek(0)
-                st.download_button(
-                    "⬇️ Excel (.xlsx)",
-                    data=buf.getvalue(),
-                    file_name=f"high_yield_scores_{ts}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
+                st.download_button("⬇️ Excel (.xlsx)", data=buf.getvalue(),
+                                   file_name=f"high_yield_scores_{ts}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
             except Exception as e:
                 st.warning(f"Excel-Export vorübergehend deaktiviert: {e}")
-                st.download_button(
-                    "⬇️ CSV (EU, Fallback)",
-                    data=csv_eu,
-                    file_name=f"high_yield_scores_{ts}_eu.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
+                st.download_button("⬇️ CSV (EU, Fallback)", data=csv_eu,
+                                   file_name=f"high_yield_scores_{ts}_eu.csv",
+                                   mime="text/csv", use_container_width=True)
 
         err_df = df[df["error"].notna()][["ticker","error"]]
         if not err_df.empty:

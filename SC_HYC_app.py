@@ -8,11 +8,16 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
+# ─────────────────────────────────────────────────────────────
+# UI-Setup
+# ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Master Scoring Model", layout="wide")
 st.title("📈 Master Scoring Model")
 st.caption("Yahoo Finance • TTM-Kennzahlen • sektorrelative Perzentile • robuste Datenlogik")
 
-# ───────── Helpers
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
 def _row(df: pd.DataFrame, keys: List[str]) -> pd.Series:
     for k in keys:
         if isinstance(df, pd.DataFrame) and k in df.index:
@@ -71,7 +76,9 @@ def _safe_info(t: yf.Ticker) -> Dict:
 def _safe_fast(t: yf.Ticker) -> Dict:
     return getattr(t, "fast_info", {}) or {}
 
-# ───────── Expected cols
+# ─────────────────────────────────────────────────────────────
+# Expected columns
+# ─────────────────────────────────────────────────────────────
 EXPECTED_COLS = [
     "ticker","sector","price","div_yield_ttm","yield_5y_median",
     "low_52w","high_52w","pos_52w",
@@ -87,7 +94,9 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = np.nan
     return df
 
-# ───────── History
+# ─────────────────────────────────────────────────────────────
+# History
+# ─────────────────────────────────────────────────────────────
 def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
     try:
         h = t.history(period=period, interval=interval, auto_adjust=True)
@@ -97,7 +106,9 @@ def _hist_close(t: yf.Ticker, period="5y", interval="1d") -> pd.Series:
         pass
     return pd.Series(dtype=float)
 
-# ───────── Metrics
+# ─────────────────────────────────────────────────────────────
+# Metrics
+# ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60*30)
 def metrics_for(ticker: str) -> Dict:
     t = yf.Ticker(ticker)
@@ -180,14 +191,14 @@ def metrics_for(ticker: str) -> Dict:
         div_cash_ttm = abs(div_paid_cf) if np.isfinite(div_paid_cf) else div_ttm_current
 
         equity = _ttm_sum(q_bs, ["Total Stockholder Equity","Total Equity Gross Minority Interest"])
-        total_deb_cf = _ttm_sum(q_bs, ["Long Term Debt"]) + _ttm_sum(q_bs, ["Short Long Term Debt","Short Term Debt"])
-        total_deb_cf = total_deb_cf if np.isfinite(total_deb_cf) else np.nan
+        total_debt_cf = _ttm_sum(q_bs, ["Long Term Debt"]) + _ttm_sum(q_bs, ["Short Long Term Debt","Short Term Debt"])
+        total_debt_cf = total_debt_cf if np.isfinite(total_debt_cf) else np.nan
 
         sector = (info.get("sector") or "Unknown")
         mcap = _to_float(info.get("marketCap", fast.get("market_cap")))
         adv3 = _to_float(info.get("averageDailyVolume3Month", fast.get("three_month_average_volume")))
 
-        total_debt = _to_float(info.get("totalDebt", total_deb_cf))
+        total_debt = _to_float(info.get("totalDebt", total_debt_cf))
         cash = _to_float(info.get("totalCash", np.nan))
 
         de_ratio = (total_debt / equity) if (np.isfinite(total_debt) and np.isfinite(equity) and equity > 0) else np.nan
@@ -240,19 +251,25 @@ def metrics_for(ticker: str) -> Dict:
     except Exception as e:
         return {"ticker": ticker, "error": str(e)}
 
-# ───────── Scoring
+# ─────────────────────────────────────────────────────────────
+# Scoring-Defaults & Weights
+# ─────────────────────────────────────────────────────────────
 DEFAULT_WEIGHTS: Dict[str, float] = {
     "sc_yield": 0.22, "sc_52w": 0.18, "sc_pe": 0.12, "sc_ev_ebitda": 0.12,
     "sc_de": 0.12, "sc_fcfm": 0.08, "sc_ebitdam": 0.06, "sc_beta": 0.06, "sc_ygap": 0.04,
 }
 
 SCORING_DEFAULTS = {
-    "yield_floor": 0.05,
-    "yield_scale": 0.05,
+    # Yield-Mapping (NEU: explizit einstellbar)
+    "yield_floor": 0.05,      # ab welcher DivR fängt die Belohnung an (z.B. 5%)
+    "yield_scale": 0.05,      # Breite bis zur Sättigung (z.B. +5% → volle 100)
+    # 52W
     "invert_52w": True,
     "pos_52w_gamma": 1.0,
+    # Beta-Kurve
     "beta_knots":  [0.4, 0.8, 1.0, 1.5],
     "beta_scores": [100, 70, 50, 0],
+    # Caps & Penalties
     "cap_max_after_cut": 59,
     "cap_max_after_cov": 49,
     "high_de_penalty": 15,
@@ -268,12 +285,15 @@ def build_scores(df: pd.DataFrame,
     P = {**SCORING_DEFAULTS, **(params or {})}
     d = df.copy()
 
-    y_floor = P["yield_floor"]; y_scale = P["yield_scale"]
+    # Yield-Mapping
+    y_floor = float(P["yield_floor"]); y_scale = float(P["yield_scale"])
     d["sc_yield"] = (np.clip((d["div_yield_ttm"] - y_floor) / y_scale, 0, 1) * 100)
 
+    # 52W-Position
     base = (1 - d["pos_52w"]) if P["invert_52w"] else d["pos_52w"]
-    d["sc_52w"] = (np.clip(base, 0, 1) ** P["pos_52w_gamma"]) * 100
+    d["sc_52w"] = (np.clip(base, 0, 1) ** float(P["pos_52w_gamma"])) * 100
 
+    # Sektor-Perzentile
     d["sc_pe"]        = _sector_percentile(d, "pe_ttm", invert=True)
     d["sc_ev_ebitda"] = _sector_percentile(d, "ev_ebitda_ttm", invert=True)
     d["sc_de"]        = _sector_percentile(d, "de_ratio", invert=True)
@@ -281,44 +301,50 @@ def build_scores(df: pd.DataFrame,
     d["sc_fcfm"]      = _sector_percentile(d, "fcf_margin_ttm", invert=False)
     d["sc_ebitdam"]   = _sector_percentile(d, "ebitda_margin_ttm", invert=False)
 
+    # Beta (stückweise linear via Knoten)
     d["sc_beta"] = d["beta_2y_w"].apply(
         lambda b: _map_beta_param(b, P["beta_knots"], P["beta_scores"]) if np.isfinite(b) else 50.0
     )
 
+    # Yield-Gap vs 5Y-Median
     ygap = np.where(d["yield_5y_median"] > 0,
                     d["div_yield_ttm"] / d["yield_5y_median"] - 1.0,
                     np.nan)
     d["sc_ygap"] = _sector_percentile(pd.DataFrame({"sector": d["sector"], "ygap": ygap}), "ygap", invert=False)
 
+    # Gewichtung
     S = d[list(DEFAULT_WEIGHTS.keys())].astype(float)
     w = pd.Series(wdict).reindex(S.columns).fillna(0.0)
     num = (S * w).sum(axis=1, skipna=True)
     den = ((~S.isna()) * w).sum(axis=1)
     d["score_raw"] = np.where(den > 0, num / den, np.nan)
 
+    # Caps/Strafen
     cap = d["score_raw"].copy()
-    cap = np.where(d["div_cut_24m"] == 1, np.minimum(cap, P["cap_max_after_cut"]), cap)
+    cap = np.where(d["div_cut_24m"] == 1, np.minimum(cap, float(P["cap_max_after_cut"])), cap)
     cap = np.where((d["fcf_payout_ttm"] > 1.0) | (d["coverage_fcf_ttm"] < 1.0),
-                   np.minimum(cap, P["cap_max_after_cov"]), cap)
-    cap = np.where((d["de_ratio"] > P["de_threshold"]), cap - P["high_de_penalty"], cap)
-    cap = np.where((d["beta_2y_w"] > P["beta_threshold"]), cap - P["high_beta_penalty"], cap)
+                   np.minimum(cap, float(P["cap_max_after_cov"])), cap)
+    cap = np.where((d["de_ratio"] > float(P["de_threshold"])), cap - float(P["high_de_penalty"]), cap)
+    cap = np.where((d["beta_2y_w"] > float(P["beta_threshold"])), cap - float(P["high_beta_penalty"]), cap)
     cap = np.where((d["pos_52w"] < 0.10) & ((d["fcf_margin_ttm"] <= 0) | (d["ebitda_margin_ttm"] <= 0)),
-                   np.minimum(cap, P["cap_max_after_cov"]), cap)
+                   np.minimum(cap, float(P["cap_max_after_cov"])), cap)
 
     d["score"] = pd.Series(cap, index=d.index).clip(0, 100)
     d["rating"] = np.select([d["score"] >= 75, (d["score"] >= 60) & (d["score"] < 75)],
                             ["BUY", "ACCUMULATE/WATCH"], default="AVOID/HOLD")
     return d
 
-# ───────── Pipeline
+# ─────────────────────────────────────────────────────────────
+# Pipeline
+# ─────────────────────────────────────────────────────────────
 def run_scoring(
     tickers: Iterable[str],
-    min_yield: float = 0.05,
-    min_mcap: float = 1_000_000_000,
-    min_adv: float = 1_500_000,
-    exclude_financials: bool = True,
+    min_yield: float = 0.00,
+    min_mcap: float = 50_000_000.0,
+    min_adv: float = 15_000.0,
+    exclude_financials: bool = False,
     drop_prefilter_fails: bool = True,
-    max_workers: int = 6,
+    max_workers: int = 10,
     weights: Dict[str, float] | None = None,
     params: Dict[str, float] | None = None,
 ) -> pd.DataFrame:
@@ -344,9 +370,9 @@ def run_scoring(
 
     df = _ensure_columns(pd.DataFrame(rows))
 
-    df["pf_yield"]  = df["div_yield_ttm"] >= min_yield
-    df["pf_mcap"]   = np.isfinite(df["market_cap"]) & (df["market_cap"] >= min_mcap)
-    df["pf_adv"]    = np.isfinite(df["adv_3m"]) & (df["adv_3m"] >= min_adv)
+    df["pf_yield"]  = df["div_yield_ttm"] >= float(min_yield)
+    df["pf_mcap"]   = np.isfinite(df["market_cap"]) & (df["market_cap"] >= float(min_mcap))
+    df["pf_adv"]    = np.isfinite(df["adv_3m"]) & (df["adv_3m"] >= float(min_adv))
     df["pf_sector"] = ~(df["sector"].fillna("Unknown").str.contains("Financial", na=False)) \
                       if exclude_financials else pd.Series(True, index=df.index)
     df["prefilter_pass"] = df[["pf_yield","pf_mcap","pf_adv","pf_sector"]].all(axis=1)
@@ -374,7 +400,69 @@ def run_scoring(
     out[num_cols] = out[num_cols].round(2)
     return out
 
-# ───────── Sidebar – Inputs (CSV/Manuell)
+# ─────────────────────────────────────────────────────────────
+# Presets (Value / Momentum / Income)
+# ─────────────────────────────────────────────────────────────
+def apply_preset(name: str):
+    """Setzt st.session_state für Gewichte, Parameter und Filter."""
+    if "weights" not in st.session_state:
+        st.session_state.weights = DEFAULT_WEIGHTS.copy()
+
+    if name == "Value":
+        # Gewichte leicht „Value-konform“
+        st.session_state.weights = {
+            "sc_yield": 0.25, "sc_52w": 0.22, "sc_pe": 0.12, "sc_ev_ebitda": 0.12,
+            "sc_de": 0.12, "sc_fcfm": 0.07, "sc_ebitdam": 0.04, "sc_beta": 0.04, "sc_ygap": 0.02,
+        }
+        st.session_state.preset_params = {
+            "yield_floor": 0.04, "yield_scale": 0.04,
+            "invert_52w": True,  "pos_52w_gamma": 1.5,
+            "beta_knots":  [0.30, 0.80, 1.00, 1.60],
+            "beta_scores": [100,   75,   55,   10],
+            "de_threshold": 2.0, "high_de_penalty": 20,
+            "beta_threshold": 1.6, "high_beta_penalty": 12,
+            "cap_max_after_cut": 55, "cap_max_after_cov": 45,
+        }
+        st.session_state.filters = {"min_yield": 0.00, "min_mcap": 50_000_000.0, "min_adv": 15_000.0,
+                                    "exclude_financials": False, "drop_pf": True}
+
+    elif name == "Momentum":
+        st.session_state.weights = {
+            "sc_yield": 0.10, "sc_52w": 0.28, "sc_pe": 0.10, "sc_ev_ebitda": 0.10,
+            "sc_de": 0.08, "sc_fcfm": 0.10, "sc_ebitdam": 0.10, "sc_beta": 0.08, "sc_ygap": 0.06,
+        }
+        st.session_state.preset_params = {
+            "yield_floor": 0.02, "yield_scale": 0.06,
+            "invert_52w": False, "pos_52w_gamma": 0.9,
+            "beta_knots":  [0.70, 1.00, 1.20, 1.60],
+            "beta_scores": [  60,   50,   40,   20],
+            "de_threshold": 3.0, "high_de_penalty": 10,
+            "beta_threshold": 1.8, "high_beta_penalty": 6,
+            "cap_max_after_cut": 60, "cap_max_after_cov": 55,
+        }
+        st.session_state.filters = {"min_yield": 0.00, "min_mcap": 150_000_000.0, "min_adv": 50_000.0,
+                                    "exclude_financials": False, "drop_pf": True}
+
+    elif name == "Income":
+        st.session_state.weights = {
+            "sc_yield": 0.32, "sc_52w": 0.14, "sc_pe": 0.10, "sc_ev_ebitda": 0.10,
+            "sc_de": 0.14, "sc_fcfm": 0.08, "sc_ebitdam": 0.05, "sc_beta": 0.04, "sc_ygap": 0.03,
+        }
+        st.session_state.preset_params = {
+            "yield_floor": 0.05, "yield_scale": 0.04,
+            "invert_52w": True,  "pos_52w_gamma": 1.2,
+            "beta_knots":  [0.40, 0.90, 1.10, 1.60],
+            "beta_scores": [ 100,   75,   50,   10],
+            "de_threshold": 2.5, "high_de_penalty": 15,
+            "beta_threshold": 1.5, "high_beta_penalty": 10,
+            "cap_max_after_cut": 50, "cap_max_after_cov": 40,
+        }
+        st.session_state.filters = {"min_yield": 0.00, "min_mcap": 100_000_000.0, "min_adv": 20_000.0,
+                                    "exclude_financials": False, "drop_pf": True}
+
+# ─────────────────────────────────────────────────────────────
+# Sidebar – Eingabedaten
+# ─────────────────────────────────────────────────────────────
 st.sidebar.header("📥 Eingabedaten")
 csv_file = st.sidebar.file_uploader("CSV mit Tickern hochladen", type=["csv"])
 uploaded_syms = []
@@ -392,15 +480,37 @@ manual_syms = [s.strip().upper() for s in manual.split(",") if s.strip()] if man
 watchlist = sorted({*uploaded_syms, *manual_syms})
 st.sidebar.caption(f"Gesamt-Watchlist: **{len(watchlist)}** Ticker")
 
-# ───────── Sidebar – Filter & Gewichte
+# ─────────────────────────────────────────────────────────────
+# Sidebar – Presets
+# ─────────────────────────────────────────────────────────────
+st.sidebar.subheader("🎛️ Presets")
+c_val, c_mom, c_inc = st.sidebar.columns(3)
+if c_val.button("Value", use_container_width=True):
+    apply_preset("Value")
+if c_mom.button("Momentum", use_container_width=True):
+    apply_preset("Momentum")
+if c_inc.button("Income", use_container_width=True):
+    apply_preset("Income")
+
+# ─────────────────────────────────────────────────────────────
+# Sidebar – Filter
+# ─────────────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Filter & Optionen")
-min_yield = st.sidebar.number_input("Min. Dividendenrendite", min_value=0.0, max_value=0.3, value=0.00, step=0.005, format="%.3f")
-min_mcap  = st.sidebar.number_input("Min. Market Cap (USD)", min_value=0.0, value=50_000_000.0, step=50_000_000.0, format="%.0f")
-min_adv   = st.sidebar.number_input("Min. 3M ADV (Shares)", min_value=0.0, value=15_000.0, step=10_000.0, format="%.0f")
-exclude_financials = st.sidebar.checkbox("Finanzsektor ausschließen", value=False)
-drop_pf = st.sidebar.checkbox("Nur Pre-Filter-Pass zeigen", value=True)
+# ggf. aus Preset übernehmen
+f = st.session_state.get("filters", {})
+min_yield = st.sidebar.number_input("Min. Dividendenrendite", min_value=0.0, max_value=0.3,
+                                    value=float(f.get("min_yield", 0.00)), step=0.005, format="%.3f")
+min_mcap  = st.sidebar.number_input("Min. Market Cap (USD)", min_value=0.0,
+                                    value=float(f.get("min_mcap", 50_000_000.0)), step=50_000_000.0, format="%.0f")
+min_adv   = st.sidebar.number_input("Min. 3M ADV (Shares)", min_value=0.0,
+                                    value=float(f.get("min_adv", 15_000.0)), step=10_000.0, format="%.0f")
+exclude_financials = st.sidebar.checkbox("Finanzsektor ausschließen", value=bool(f.get("exclude_financials", False)))
+drop_pf = st.sidebar.checkbox("Nur Pre-Filter-Pass zeigen", value=bool(f.get("drop_pf", True)))
 max_workers = st.sidebar.slider("Parallel-Worker", 1, 12, 10)
 
+# ─────────────────────────────────────────────────────────────
+# Sidebar – Gewichte
+# ─────────────────────────────────────────────────────────────
 st.sidebar.subheader("⚖️ Gewichte (Score-Komponenten)")
 if "weights" not in st.session_state:
     st.session_state.weights = DEFAULT_WEIGHTS.copy()
@@ -423,7 +533,6 @@ label_map = {
     "sc_beta": "Beta",
     "sc_ygap": "Yield-/Median-Gap",
 }
-
 tmp_weights = {}
 for k, default in DEFAULT_WEIGHTS.items():
     tmp_weights[k] = st.sidebar.slider(
@@ -432,35 +541,46 @@ for k, default in DEFAULT_WEIGHTS.items():
         float(st.session_state.weights.get(k, default)),
         0.01
     )
-
 total_w = sum(tmp_weights.values())
 weights = {k: v / total_w for k, v in tmp_weights.items()} if (auto_norm and total_w > 0) else tmp_weights
 st.session_state.weights = tmp_weights
 st.sidebar.caption(f"Gewichtssumme: **{sum(weights.values()):.2f}**")
 
-# ───────── Sidebar – Scoring-Parameter
+# ─────────────────────────────────────────────────────────────
+# Sidebar – Scoring-Parameter (inkl. Yield-Floor/-Scale)
+# ─────────────────────────────────────────────────────────────
 st.sidebar.subheader("🧮 Scoring-Parameter")
 
-y_floor = st.sidebar.number_input("Yield-Floor (0=0%)", min_value=0.0, max_value=0.2, value=float(SCORING_DEFAULTS["yield_floor"]), step=0.005, format="%.3f")
-y_scale = st.sidebar.number_input("Yield-Scale (0..1)",   min_value=0.001, max_value=0.5, value=float(SCORING_DEFAULTS["yield_scale"]), step=0.005, format="%.3f")
+# Falls Preset gesetzt wurde
+P0 = st.session_state.get("preset_params", SCORING_DEFAULTS)
 
-invert_52w = st.sidebar.checkbox("52W invertieren (nah am Low = besser)", value=SCORING_DEFAULTS["invert_52w"])
-pos_gamma  = st.sidebar.slider("52W-Gamma (Nichtlinearität)", 0.3, 3.0, value=float(SCORING_DEFAULTS["pos_52w_gamma"]), step=0.1)
+y_floor = st.sidebar.number_input("Yield-Floor (0=0%)", min_value=0.0, max_value=0.2,
+                                  value=float(P0.get("yield_floor", SCORING_DEFAULTS["yield_floor"])),
+                                  step=0.005, format="%.3f")
+y_scale = st.sidebar.number_input("Yield-Scale (0..1)",   min_value=0.001, max_value=0.5,
+                                  value=float(P0.get("yield_scale", SCORING_DEFAULTS["yield_scale"])),
+                                  step=0.005, format="%.3f")
 
-# Beta-Knoten/Scores (einzeln, Typen konsistent)
+invert_52w = st.sidebar.checkbox("52W invertieren (nah am Low = besser)",
+                                 value=bool(P0.get("invert_52w", True)))
+pos_gamma  = st.sidebar.slider("52W-Gamma (Nichtlinearität)", 0.3, 3.0,
+                               value=float(P0.get("pos_52w_gamma", 1.0)), step=0.1)
+
+# Beta-Kurve (je ein Control pro Knoten/Wert)
 c1, c2, c3, c4 = st.sidebar.columns(4)
-beta_lo = c1.number_input("β lo", min_value=0.0, max_value=3.0, value=float(SCORING_DEFAULTS["beta_knots"][0]), step=0.05, key="beta_lo")
-beta_m1 = c2.number_input("β m1", min_value=0.0, max_value=3.0, value=float(SCORING_DEFAULTS["beta_knots"][1]), step=0.05, key="beta_m1")
-beta_m2 = c3.number_input("β m2", min_value=0.0, max_value=3.0, value=float(SCORING_DEFAULTS["beta_knots"][2]), step=0.05, key="beta_m2")
-beta_hi = c4.number_input("β hi", min_value=0.0, max_value=3.0, value=float(SCORING_DEFAULTS["beta_knots"][3]), step=0.05, key="beta_hi")
+beta_kn = P0.get("beta_knots", [0.4,0.8,1.0,1.5])
+beta_lo = c1.number_input("β lo", min_value=0.0, max_value=3.0, value=float(beta_kn[0]), step=0.05, key="beta_lo")
+beta_m1 = c2.number_input("β m1", min_value=0.0, max_value=3.0, value=float(beta_kn[1]), step=0.05, key="beta_m1")
+beta_m2 = c3.number_input("β m2", min_value=0.0, max_value=3.0, value=float(beta_kn[2]), step=0.05, key="beta_m2")
+beta_hi = c4.number_input("β hi", min_value=0.0, max_value=3.0, value=float(beta_kn[3]), step=0.05, key="beta_hi")
 
 d1, d2, d3, d4 = st.sidebar.columns(4)
-score_lo = d1.number_input("Pts lo", min_value=0, max_value=100, value=int(SCORING_DEFAULTS["beta_scores"][0]), step=1, key="score_lo")
-score_m1 = d2.number_input("Pts m1", min_value=0, max_value=100, value=int(SCORING_DEFAULTS["beta_scores"][1]), step=1, key="score_m1")
-score_m2 = d3.number_input("Pts m2", min_value=0, max_value=100, value=int(SCORING_DEFAULTS["beta_scores"][2]), step=1, key="score_m2")
-score_hi = d4.number_input("Pts hi", min_value=0, max_value=100, value=int(SCORING_DEFAULTS["beta_scores"][3]), step=1, key="score_hi")
+beta_sc = P0.get("beta_scores", [100,70,50,0])
+score_lo = d1.number_input("Pts lo", min_value=0, max_value=100, value=int(beta_sc[0]), step=1, key="score_lo")
+score_m1 = d2.number_input("Pts m1", min_value=0, max_value=100, value=int(beta_sc[1]), step=1, key="score_m1")
+score_m2 = d3.number_input("Pts m2", min_value=0, max_value=100, value=int(beta_sc[2]), step=1, key="score_m2")
+score_hi = d4.number_input("Pts hi", min_value=0, max_value=100, value=int(beta_sc[3]), step=1, key="score_hi")
 
-# Monotonie absichern
 knots = [beta_lo, beta_m1, beta_m2, beta_hi]
 scores = [float(score_lo), float(score_m1), float(score_m2), float(score_hi)]
 if any(np.diff(knots) < 0):
@@ -469,13 +589,19 @@ if any(np.diff(knots) < 0):
     scores = [scores[i] for i in order]
     st.sidebar.info("β-Knoten wurden aufsteigend sortiert.")
 
-de_thr  = st.sidebar.number_input("D/E-Schwelle für Strafe", min_value=0.0, max_value=10.0, value=float(SCORING_DEFAULTS["de_threshold"]), step=0.1)
-de_pen  = st.sidebar.number_input("Strafe bei hohem D/E",     min_value=0,   max_value=50,   value=int(SCORING_DEFAULTS["high_de_penalty"]),  step=1)
-beta_thr= st.sidebar.number_input("Beta-Schwelle für Strafe", min_value=0.0, max_value=3.0,  value=float(SCORING_DEFAULTS["beta_threshold"]), step=0.1)
-beta_pen= st.sidebar.number_input("Strafe bei hohem Beta",    min_value=0,   max_value=50,   value=int(SCORING_DEFAULTS["high_beta_penalty"]), step=1)
+de_thr  = st.sidebar.number_input("D/E-Schwelle für Strafe", min_value=0.0, max_value=10.0,
+                                  value=float(P0.get("de_threshold", 2.5)), step=0.1)
+de_pen  = st.sidebar.number_input("Strafe bei hohem D/E",     min_value=0,   max_value=50,
+                                  value=int(P0.get("high_de_penalty", 15)),  step=1)
+beta_thr= st.sidebar.number_input("Beta-Schwelle für Strafe", min_value=0.0, max_value=3.0,
+                                  value=float(P0.get("beta_threshold", 1.5)), step=0.1)
+beta_pen= st.sidebar.number_input("Strafe bei hohem Beta",    min_value=0,   max_value=50,
+                                  value=int(P0.get("high_beta_penalty", 10)), step=1)
 
-cap_cut = st.sidebar.number_input("Cap nach Div-Cut (max Score)",       min_value=0, max_value=100, value=int(SCORING_DEFAULTS["cap_max_after_cut"]), step=1)
-cap_cov = st.sidebar.number_input("Cap bei schwacher Coverage (max Score)", min_value=0, max_value=100, value=int(SCORING_DEFAULTS["cap_max_after_cov"]), step=1)
+cap_cut = st.sidebar.number_input("Cap nach Div-Cut (max Score)", min_value=0, max_value=100,
+                                  value=int(P0.get("cap_max_after_cut", 59)), step=1)
+cap_cov = st.sidebar.number_input("Cap bei schwacher Coverage (max Score)", min_value=0, max_value=100,
+                                  value=int(P0.get("cap_max_after_cov", 49)), step=1)
 
 params = {
     "yield_floor": y_floor, "yield_scale": y_scale,
@@ -488,7 +614,9 @@ params = {
 
 run_btn = st.sidebar.button("🔎 Score berechnen", use_container_width=True)
 
-# ───────── Main
+# ─────────────────────────────────────────────────────────────
+# Main – Output
+# ─────────────────────────────────────────────────────────────
 st.subheader("Watchlist")
 if watchlist:
     with st.expander(f"Watchlist anzeigen ({len(watchlist)} Ticker)"):
@@ -545,9 +673,11 @@ if run_btn and watchlist:
         csv_us = df.to_csv(index=False).encode("utf-8")
         csv_eu = df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
         with c_us:
-            st.download_button("⬇️ CSV (US, , .)", data=csv_us, file_name=f"high_yield_scores_{ts}.csv", mime="text/csv", use_container_width=True)
+            st.download_button("⬇️ CSV (US, , .)", data=csv_us, file_name=f"high_yield_scores_{ts}.csv",
+                               mime="text/csv", use_container_width=True)
         with c_eu:
-            st.download_button("⬇️ CSV (EU, ; , ,)", data=csv_eu, file_name=f"high_yield_scores_{ts}_eu.csv", mime="text/csv", use_container_width=True)
+            st.download_button("⬇️ CSV (EU, ; , ,)", data=csv_eu, file_name=f"high_yield_scores_{ts}_eu.csv",
+                               mime="text/csv", use_container_width=True)
         with c_xlsx:
             try:
                 buf = BytesIO()

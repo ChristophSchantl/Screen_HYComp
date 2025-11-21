@@ -48,11 +48,13 @@ def _hist_close(ticker: str, period="5y", interval="1d") -> pd.Series:
     try:
         h = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
         if "Close" in h: return h["Close"].dropna()
-    except Exception: pass
+    except Exception: 
+        pass
     try:
         h = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
         if "Close" in h: return h["Close"].dropna()
-    except Exception: pass
+    except Exception: 
+        pass
     return pd.Series(dtype=float)
 
 # ─────────────────────────────────────────────────────────────
@@ -67,21 +69,29 @@ def fetch_metrics(tk: str) -> dict:
         except Exception:
             info = getattr(t, "info", {}) or {}
 
+        # Name aus Yahoo (LongName > ShortName > Ticker)
+        name = info.get("longName") or info.get("shortName") or tk
+
         px = _hist_close(tk, "5y", "1d")
-        if px.empty: raise RuntimeError("no_price_history")
+        if px.empty: 
+            raise RuntimeError("no_price_history")
         price = float(px.iloc[-1])
 
         # 52W nur aus ADJUSTED history
         px1y = _hist_close(tk, "1y", "1d")
-        if px1y.empty: px1y = px.tail(252)
+        if px1y.empty: 
+            px1y = px.tail(252)
         low_52w  = float(px1y.min())
         high_52w = float(px1y.max())
         rng = high_52w - low_52w
         pos_52w = (price - low_52w) / (rng if rng > 0 else np.nan)
 
         # Dividenden (TTM + 5y Median Yield)
-        try: div = t.get_dividends()
-        except Exception: div = getattr(t, "dividends", pd.Series(dtype=float))
+        try: 
+            div = t.get_dividends()
+        except Exception: 
+            div = getattr(t, "dividends", pd.Series(dtype=float))
+
         pm = px.resample("M").last()
         dm = div.resample("M").sum().reindex(pm.index, fill_value=0.0) if isinstance(div, pd.Series) else pd.Series(0.0, index=pm.index)
         ttm_div_m = dm.rolling(12, min_periods=1).sum()
@@ -107,7 +117,7 @@ def fetch_metrics(tk: str) -> dict:
         total_debt = _ttm_sum(q_bs,["Long Term Debt"]) + _ttm_sum(q_bs,["Short Long Term Debt","Short Term Debt"])
         de_ratio = (total_debt/equity) if (np.isfinite(total_debt) and np.isfinite(equity) and equity>0) else np.nan
 
-        # Beta (2y weekly) – einfacher linearer Score später
+        # Beta (2y weekly)
         try:
             spx = yf.Ticker("^GSPC").history(period="2y", interval="1wk", auto_adjust=True)["Close"].pct_change().dropna()
             stw = t.history(period="2y", interval="1wk", auto_adjust=True)["Close"].pct_change().dropna()
@@ -119,38 +129,60 @@ def fetch_metrics(tk: str) -> dict:
         # EV/EBITDA, Meta
         mcap=_to_float(info.get("marketCap"))
         pe  =_to_float(info.get("trailingPE"))
-        cash=_to_float(info.get("totalCash")); debt=_to_float(info.get("totalDebt"))
+        cash=_to_float(info.get("totalCash"))
+        debt=_to_float(info.get("totalDebt"))
         ev = mcap if np.isfinite(mcap) else np.nan
-        if np.isfinite(ev): ev += (debt if np.isfinite(debt) else 0) - (cash if np.isfinite(cash) else 0)
+        if np.isfinite(ev): 
+            ev += (debt if np.isfinite(debt) else 0) - (cash if np.isfinite(cash) else 0)
         ev_ebitda = (ev/ebitda) if (np.isfinite(ev) and np.isfinite(ebitda) and ebitda>0) else np.nan
 
         sector = (info.get("sector") or "Unknown")
         adv3   = _to_float(info.get("averageDailyVolume3Month"))
 
-        return dict(ticker=tk, sector=sector, price=price,
-            low_52w=low_52w, high_52w=high_52w, pos_52w=pos_52w,
-            div_yield_ttm=yld_ttm, yield_5y_median=yld_med5,
-            pe_ttm=pe, ev_ebitda_ttm=ev_ebitda, de_ratio=de_ratio,
-            fcf_margin_ttm=fcf_margin, ebitda_margin_ttm=ebitda_margin,
-            beta_2y_w=beta, market_cap=mcap, adv_3m=adv3,
-            error=np.nan)
+        return dict(
+            ticker=tk,
+            name=name,                     # <-- NEU: Unternehmensname
+            sector=sector,
+            price=price,
+            low_52w=low_52w,
+            high_52w=high_52w,
+            pos_52w=pos_52w,
+            div_yield_ttm=yld_ttm,
+            yield_5y_median=yld_med5,
+            pe_ttm=pe,
+            ev_ebitda_ttm=ev_ebitda,
+            de_ratio=de_ratio,
+            fcf_margin_ttm=fcf_margin,
+            ebitda_margin_ttm=ebitda_margin,
+            beta_2y_w=beta,
+            market_cap=mcap,
+            adv_3m=adv3,
+            error=np.nan
+        )
     except Exception as e:
-        return {"ticker": tk, "error": str(e)}
+        # Name hier zur Sicherheit nur der Ticker
+        return {"ticker": tk, "name": tk, "error": str(e)}
 
 # ─────────────────────────────────────────────────────────────
 # Scoring – schlank, ohne Schwellen/Caps
 # ─────────────────────────────────────────────────────────────
 FACTORS = ["sc_yield","sc_52w","sc_pe","sc_ev_ebitda","sc_de","sc_fcfm","sc_ebitdam","sc_beta","sc_ygap"]
-DEFAULT_W = {"sc_yield":0.25,"sc_52w":0.22,"sc_pe":0.12,"sc_ev_ebitda":0.12,"sc_de":0.12,"sc_fcfm":0.07,"sc_ebitdam":0.04,"sc_beta":0.04,"sc_ygap":0.02}
+DEFAULT_W = {
+    "sc_yield":0.25,"sc_52w":0.22,"sc_pe":0.12,"sc_ev_ebitda":0.12,
+    "sc_de":0.12,"sc_fcfm":0.07,"sc_ebitdam":0.04,"sc_beta":0.04,"sc_ygap":0.02
+}
 
 PARAMS_DEF = dict(
-    yield_floor=0.04, yield_scale=0.04,
-    invert_52w=True, pos_52w_gamma=1.5,
+    yield_floor=0.04, 
+    yield_scale=0.04,
+    invert_52w=True, 
+    pos_52w_gamma=1.5,
 )
 
 def _beta_score_linear(beta: float) -> float:
-    # Einfach: Beta 0.5 → 100, 1.0 → 50, 1.5 → 0 (linear clamp)
-    if not np.isfinite(beta): return 50.0
+    # Beta 0.5 → 100, 1.0 → 50, 1.5 → 0 (linear)
+    if not np.isfinite(beta): 
+        return 50.0
     return float(np.clip(100 - (beta - 0.5) * 100, 0, 100))
 
 def build_scores(df: pd.DataFrame, weights: dict, params: dict,
@@ -194,8 +226,11 @@ def build_scores(df: pd.DataFrame, weights: dict, params: dict,
     den=float(W.sum()) if fixed_denominator else ((~S.isna())*W).sum(axis=1)
     d["score"]=np.where(den>0,num/den,np.nan).clip(0,100)
 
-    d["rating"]=np.select([d["score"]>=75,(d["score"]>=60)&(d["score"]<75)],
-                          ["BUY","ACCUMULATE/WATCH"],"AVOID/HOLD")
+    d["rating"]=np.select(
+        [d["score"]>=75,(d["score"]>=60)&(d["score"]<75)],
+        ["BUY","ACCUMULATE/WATCH"],
+        "AVOID/HOLD"
+    )
     return d
 
 # ─────────────────────────────────────────────────────────────
@@ -205,10 +240,13 @@ st.sidebar.header("📥 Eingabe")
 csv_file=st.sidebar.file_uploader("CSV mit Ticker-Spalte", type=["csv"])
 tickers=[]
 if csv_file is not None:
-    try: df_csv=pd.read_csv(csv_file)
-    except Exception: csv_file.seek(0); df_csv=pd.read_csv(csv_file, sep=";")
+    try: 
+        df_csv=pd.read_csv(csv_file)
+    except Exception: 
+        csv_file.seek(0); df_csv=pd.read_csv(csv_file, sep=";")
     col=st.sidebar.selectbox("Ticker-Spalte", df_csv.columns.tolist())
     tickers=df_csv[col].astype(str).str.strip().replace({"nan":np.nan}).dropna().tolist()
+
 manual = st.sidebar.text_area("Ticker manuell (kommasepariert)", "DHL.DE, DBK.DE, T, VZ, MO")
 tickers=sorted({*tickers, *[s.strip().upper() for s in manual.split(",") if s.strip()]})
 st.sidebar.caption(f"Watchlist: **{len(tickers)}**")
@@ -225,8 +263,11 @@ params=dict(yield_floor=y_floor, yield_scale=y_scale, invert_52w=invert_52w, pos
 
 st.sidebar.subheader("⚖️ Gewichte")
 tmp_w={}
-labels={"sc_yield":"Yield","sc_52w":"52W","sc_pe":"PE(inv)","sc_ev_ebitda":"EV/EBITDA(inv)","sc_de":"D/E(inv)",
-        "sc_fcfm":"FCF-Marge","sc_ebitdam":"EBITDA-Marge","sc_beta":"Beta","sc_ygap":"Yield-Gap"}
+labels={
+    "sc_yield":"Yield","sc_52w":"52W","sc_pe":"PE(inv)","sc_ev_ebitda":"EV/EBITDA(inv)",
+    "sc_de":"D/E(inv)","sc_fcfm":"FCF-Marge","sc_ebitdam":"EBITDA-Marge",
+    "sc_beta":"Beta","sc_ygap":"Yield-Gap"
+}
 for k in FACTORS:
     tmp_w[k]=st.sidebar.slider(labels.get(k,k), 0.0, 1.0, float(DEFAULT_W.get(k,0.0)), 0.01)
 sum_w=sum(tmp_w.values())
@@ -261,62 +302,116 @@ if run and tickers:
     df=pd.DataFrame(rows)
     base=df[df["error"].isna()].copy()
     if base.empty:
-        st.warning("Keine verwertbaren Daten."); st.dataframe(df, use_container_width=True); st.stop()
+        st.warning("Keine verwertbaren Daten.")
+        st.dataframe(df, use_container_width=True)
+        st.stop()
 
-    out=build_scores(base, weights=weights, params=params,
-                     fixed_denominator=fixed_den, missing_policy=missing_policy).copy()
+    out=build_scores(
+        base, 
+        weights=weights, 
+        params=params,
+        fixed_denominator=fixed_den, 
+        missing_policy=missing_policy
+    ).copy()
+
     out["div_yield_%"]=out["div_yield_ttm"]*100
     out["near_52w_low_%"]=(1-out["pos_52w"]).clip(0,1)*100
 
-    cols=["ticker","sector","price","low_52w","high_52w","pos_52w","near_52w_low_%",
-          "pe_ttm","ev_ebitda_ttm","de_ratio","fcf_margin_ttm","ebitda_margin_ttm",
-          "beta_2y_w","market_cap","adv_3m","score","rating","error"]
+    # NEU: name in der Ergebnisliste
+    cols=[
+        "ticker","name","sector","price",
+        "low_52w","high_52w","pos_52w","near_52w_low_%",
+        "pe_ttm","ev_ebitda_ttm","de_ratio",
+        "fcf_margin_ttm","ebitda_margin_ttm",
+        "beta_2y_w","market_cap","adv_3m",
+        "score","rating","error"
+    ]
+
     st.subheader("Ergebnisse (Ranking)")
-    st.dataframe(out.sort_values("score", ascending=False).reset_index(drop=True).round(3)[cols], use_container_width=True)
+    st.dataframe(
+        out.sort_values("score", ascending=False)
+           .reset_index(drop=True)
+           .round(3)[cols],
+        use_container_width=True
+    )
 
     # Executive Summary (kompakt)
     st.markdown("### Executive Summary")
     vc=out["rating"].value_counts()
-    kpi_total=len(out); kpi_buy=int(vc.get("BUY",0)); kpi_acc=int(vc.get("ACCUMULATE/WATCH",0)); kpi_hold=int(vc.get("AVOID/HOLD",0))
-    kpi_score_avg=float(out["score"].mean()); kpi_yield_med=float(out["div_yield_%"].median())
+    kpi_total=len(out)
+    kpi_buy=int(vc.get("BUY",0))
+    kpi_acc=int(vc.get("ACCUMULATE/WATCH",0))
+    kpi_hold=int(vc.get("AVOID/HOLD",0))
+    kpi_score_avg=float(out["score"].mean())
+    kpi_yield_med=float(out["div_yield_%"].median())
     kpi_nearlow_med=float(out["near_52w_low_%"].median())
     c1,c2,c3,c4,c5=st.columns(5)
-    c1.metric("Total",kpi_total); c2.metric("BUY",kpi_buy); c3.metric("ACC/W",kpi_acc)
-    c4.metric("Score ⌀",f"{kpi_score_avg:.1f}"); c5.metric("Yield (Med.)",f"{kpi_yield_med:.2f}%")
+    c1.metric("Total",kpi_total)
+    c2.metric("BUY",kpi_buy)
+    c3.metric("ACC/W",kpi_acc)
+    c4.metric("Score ⌀",f"{kpi_score_avg:.1f}")
+    c5.metric("Yield (Med.)",f"{kpi_yield_med:.2f}%")
     st.metric("Nähe 52W-Low (Med.)", f"{kpi_nearlow_med:.1f}%")
 
     # Top-10 Faktor-Beiträge
     st.markdown("### Top 10 – Faktor-Beitrag")
-    lbl={"sc_yield":"Yield","sc_52w":"52W","sc_pe":"PE(inv)","sc_ev_ebitda":"EV/EBITDA(inv)","sc_de":"D/E(inv)","sc_fcfm":"FCF%","sc_ebitdam":"EBITDA%","sc_beta":"Beta","sc_ygap":"YieldGap"}
+    lbl={
+        "sc_yield":"Yield","sc_52w":"52W","sc_pe":"PE(inv)",
+        "sc_ev_ebitda":"EV/EBITDA(inv)","sc_de":"D/E(inv)",
+        "sc_fcfm":"FCF%","sc_ebitdam":"EBITDA%","sc_beta":"Beta",
+        "sc_ygap":"YieldGap"
+    }
     top=out.sort_values("score",ascending=False).head(10).copy()
-    S=top[FACTORS].astype(float); Wser=pd.Series(weights).reindex(FACTORS).fillna(0.0)
-    contrib=S.mul(Wser,axis=1); contrib.columns=[lbl.get(c,c) for c in contrib.columns]
-    contrib.insert(0,"ticker",top["ticker"].values); contrib.insert(1,"score",top["score"].values)
+    S=top[FACTORS].astype(float)
+    Wser=pd.Series(weights).reindex(FACTORS).fillna(0.0)
+    contrib=S.mul(Wser,axis=1)
+    contrib.columns=[lbl.get(c,c) for c in contrib.columns]
+    contrib.insert(0,"ticker",top["ticker"].values)
+    contrib.insert(1,"score",top["score"].values)
     st.dataframe(contrib.set_index("ticker").round(2), use_container_width=True)
 
     # Faktor-Heatmap
     st.markdown("### Universum – Faktor-Median (0–100)")
     factor_meds=out[FACTORS].median().rename(lambda c: lbl.get(c,c))
-    st.dataframe(pd.DataFrame(factor_meds,columns=["Median"]).T.style.background_gradient(axis=1), use_container_width=True)
+    st.dataframe(
+        pd.DataFrame(factor_meds,columns=["Median"]).T
+          .style.background_gradient(axis=1),
+        use_container_width=True
+    )
 
-    # Exporte
+    # Exporte (inkl. name-Spalte)
     ts=pd.Timestamp.now().strftime("%Y-%m-%d_%H%M")
     c_us,c_eu,c_xlsx=st.columns(3)
     with c_us:
-        st.download_button("⬇️ CSV (US)", out.to_csv(index=False).encode("utf-8"),
-                           file_name=f"scores_{ts}.csv", mime="text/csv", use_container_width=True)
+        st.download_button(
+            "⬇️ CSV (US)",
+            out.to_csv(index=False).encode("utf-8"),
+            file_name=f"scores_{ts}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
     with c_eu:
-        st.download_button("⬇️ CSV (EU)", out.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
-                           file_name=f"scores_{ts}_eu.csv", mime="text/csv", use_container_width=True)
+        st.download_button(
+            "⬇️ CSV (EU)",
+            out.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+            file_name=f"scores_{ts}_eu.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
     with c_xlsx:
-        buf=BytesIO(); out.to_excel(buf, index=False, sheet_name="Scores"); buf.seek(0)
-        st.download_button("⬇️ Excel", buf.getvalue(),
-                           file_name=f"scores_{ts}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
+        buf=BytesIO()
+        out.to_excel(buf, index=False, sheet_name="Scores")
+        buf.seek(0)
+        st.download_button(
+            "⬇️ Excel",
+            buf.getvalue(),
+            file_name=f"scores_{ts}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
 
     # Fehlerliste
-    err=df[df["error"].notna()][["ticker","error"]]
+    err=df[df["error"].notna()][["ticker","name","error"]]
     if not err.empty:
         st.warning("Hinweise/Fehler beim Laden einiger Ticker:")
         st.dataframe(err, use_container_width=True)

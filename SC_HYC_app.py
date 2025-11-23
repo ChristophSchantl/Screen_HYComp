@@ -168,8 +168,8 @@ def fetch_metrics(tk: str) -> dict:
 # ─────────────────────────────────────────────────────────────
 FACTORS = ["sc_yield","sc_52w","sc_pe","sc_ev_ebitda","sc_de","sc_fcfm","sc_ebitdam","sc_beta","sc_ygap"]
 DEFAULT_W = {
-    "sc_yield":0.25,"sc_52w":0.22,"sc_pe":0.12,"sc_ev_ebitda":0.12,
-    "sc_de":0.12,"sc_fcfm":0.07,"sc_ebitdam":0.04,"sc_beta":0.04,"sc_ygap":0.02
+    "sc_yield":0.0,"sc_52w":0.50,"sc_pe":0.20,"sc_ev_ebitda":0.20,
+    "sc_de":0.05,"sc_fcfm":0.05,"sc_ebitdam":0.00,"sc_beta":0.00,"sc_ygap":0.00
 }
 
 PARAMS_DEF = dict(
